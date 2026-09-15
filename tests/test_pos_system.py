@@ -1,3 +1,5 @@
+"""Tests for the QuickServe POS business logic."""
+
 from decimal import Decimal
 
 import pytest
@@ -7,6 +9,7 @@ from restaurant_pos.payments import Order, PaymentError, PaymentProcessor
 
 
 def test_order_total_calculations_and_tax_logic():
+    """Calculate subtotal, discount, tax, and total correctly."""
     menu = build_demo_menu()
     order = Order(tax_rate=0.08)
 
@@ -24,6 +27,7 @@ def test_order_total_calculations_and_tax_logic():
 
 
 def test_invalid_discount_range_raises_value_error():
+    """Reject discounts outside the inclusive zero-to-one-hundred range."""
     order = Order()
 
     with pytest.raises(ValueError):
@@ -34,6 +38,7 @@ def test_invalid_discount_range_raises_value_error():
 
 
 def test_payment_failure_rolls_back_order():
+    """Roll back the order when payment processing fails."""
     menu = build_demo_menu()
     order = Order(tax_rate=0.08)
     order.add_item(menu.get_item("SODA"), 2)
@@ -42,12 +47,13 @@ def test_payment_failure_rolls_back_order():
     with pytest.raises(PaymentError):
         processor.process_payment(order, Decimal("5.00"), trigger_failure=True)
 
-    assert order.items == []
+    assert not order.items
     assert order.discount_percentage == Decimal("0")
     assert order.paid is False
 
 
 def test_receipt_formatting_contains_totals_and_items():
+    """Include item names and totals in the generated receipt."""
     menu = build_demo_menu()
     order = Order(tax_rate=0.08)
     order.add_item(menu.get_item("PASTA"), 1)

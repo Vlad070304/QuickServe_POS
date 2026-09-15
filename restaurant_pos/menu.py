@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 
 @dataclass(frozen=True)
 class MenuItem:
+    """Describe a menu item and its available stock."""
+
     sku: str
     name: str
     category: str
@@ -15,6 +17,7 @@ class MenuItem:
     stock: int = 0
 
     def __post_init__(self) -> None:
+        """Validate the item's price and stock values."""
         if self.price < 0:
             raise ValueError("Price cannot be negative.")
         if self.stock < 0:
@@ -25,23 +28,28 @@ class Menu:
     """Simple in-memory menu registry."""
 
     def __init__(self) -> None:
+        """Create an empty menu registry."""
         self._items: Dict[str, MenuItem] = {}
 
     def add_item(self, item: MenuItem) -> None:
+        """Add a menu item, rejecting duplicate SKUs."""
         if item.sku in self._items:
             raise ValueError(f"Menu item with sku '{item.sku}' already exists.")
         self._items[item.sku] = item
 
     def get_item(self, sku: str) -> MenuItem:
+        """Return the menu item for a SKU or raise an error."""
         item = self._items.get(sku)
         if item is None:
             raise KeyError(f"Invalid menu item: {sku}")
         return item
 
     def list_items(self) -> List[MenuItem]:
+        """Return menu items sorted alphabetically by name."""
         return sorted(self._items.values(), key=lambda item: item.name)
 
     def update_stock(self, sku: str, quantity: int) -> None:
+        """Adjust stock for a menu item by the requested quantity."""
         item = self.get_item(sku)
         new_stock = item.stock + quantity
         if new_stock < 0:
@@ -55,13 +63,16 @@ class Menu:
         )
 
     def remove_item(self, sku: str) -> None:
+        """Remove a menu item if it exists."""
         self._items.pop(sku, None)
 
     def clear(self) -> None:
+        """Remove all menu items."""
         self._items.clear()
 
 
 def build_demo_menu() -> Menu:
+    """Build the sample menu used by the desktop application."""
     menu = Menu()
     menu.add_item(MenuItem("BURGER", "Classic Burger", "Main", 12.00, stock=25))
     menu.add_item(MenuItem("FRIES", "Sweet Potato Fries", "Sides", 4.50, stock=30))
