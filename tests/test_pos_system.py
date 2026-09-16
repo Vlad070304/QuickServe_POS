@@ -10,6 +10,7 @@ from restaurant_pos.app import RestaurantPOSApp
 from restaurant_pos.menu import Menu, MenuItem, build_demo_menu
 from restaurant_pos.payments import Order, PaymentError, PaymentProcessor, money
 from restaurant_pos.reporting import SalesReport
+from restaurant_pos.services import CheckoutService
 
 
 @pytest.fixture(name="pos_app")
@@ -199,6 +200,34 @@ def test_sales_report_rejects_empty_orders():
     """Do not include empty orders in sales reporting."""
     with pytest.raises(ValueError):
         SalesReport().add_order(Order())
+
+
+def test_checkout_service_validates_stock_and_records_sale():
+    """Coordinate inventory, payment, and sales reporting outside the UI."""
+    menu = Menu()
+    menu.add_item(MenuItem("ITEM", "Test item", "Test", 1.00, stock=2))
+    report = SalesReport()
+    service = CheckoutService(menu, PaymentProcessor(tax_rate=0), report)
+    order = Order(tax_rate=0)
+
+    service.add_item(order, "ITEM", 2)
+    result = service.checkout(order, Decimal("2.00"))
+
+    assert result["status"] == "paid"
+    assert menu.get_item("ITEM").stock == 0
+    assert report.items_sold() == {"Test item": 2}
+    assert not order.items
+
+
+def test_checkout_service_rejects_order_above_available_stock():
+    """Reject an order before payment when inventory is insufficient."""
+    menu = Menu()
+    menu.add_item(MenuItem("ITEM", "Test item", "Test", 1.00, stock=1))
+    service = CheckoutService(menu, PaymentProcessor(tax_rate=0), SalesReport())
+    order = Order(tax_rate=0)
+
+    with pytest.raises(ValueError, match="Not enough stock"):
+        service.add_item(order, "ITEM", 2)
 
 
 @given(

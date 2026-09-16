@@ -14,6 +14,7 @@ A desktop point-of-sale application built with Python and Tkinter for fast resta
 
 - `restaurant_pos/menu.py` – menu definitions and stock handling
 - `restaurant_pos/payments.py` – order totals, discounts, tax, payments, and receipts
+- `restaurant_pos/services.py` – UI-independent checkout and inventory orchestration
 - `restaurant_pos/app.py` – Tkinter user interface
 - `tests/test_pos_system.py` – pytest coverage for totals, discounts, tax, and payment rollback
 

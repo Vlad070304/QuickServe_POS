@@ -6,8 +6,9 @@ import tkinter as tk
 from tkinter import messagebox
 
 from .menu import build_demo_menu
-from .payments import Order, OrderItem, PaymentError, PaymentProcessor
+from .payments import Order, PaymentError, PaymentProcessor
 from .reporting import SalesReport
+from .services import CheckoutService
 
 
 class RestaurantPOSApp(tk.Tk):
@@ -24,6 +25,11 @@ class RestaurantPOSApp(tk.Tk):
         self.order = Order()
         self.processor = PaymentProcessor(tax_rate=0.08)
         self.sales_report = SalesReport()
+        self.checkout_service = CheckoutService(
+            self.menu,
+            self.processor,
+            self.sales_report,
+        )
 
         self.build_ui()
         self.refresh_order_panel()
@@ -170,7 +176,7 @@ class RestaurantPOSApp(tk.Tk):
         """Add a selected menu item to the active order."""
         try:
             menu_item = self.menu.get_item(sku)
-            self.order.add_item(menu_item, quantity=1)
+            self.checkout_service.add_item(self.order, sku)
             self.status_var.set(f"Added {menu_item.name} to the order.")
             self.refresh_order_panel()
         except ValueError as exc:
@@ -211,26 +217,13 @@ class RestaurantPOSApp(tk.Tk):
         """Process the entered payment and display the resulting receipt."""
         try:
             amount = float(self.payment_entry.get())
-            payment_result = self.processor.process_payment(self.order, amount)
+            payment_result = self.checkout_service.checkout(self.order, amount)
             receipt_text = payment_result["receipt"]
-
-            report_order = Order(tax_rate=self.order.tax_rate)
-            for item in self.order.items:
-                report_order.items.append(
-                    OrderItem(
-                        sku=item.sku,
-                        name=item.name,
-                        quantity=item.quantity,
-                        unit_price=item.unit_price,
-                    )
-                )
-            self.sales_report.add_order(report_order)
 
             self.status_var.set(
                 "Payment successful. Receipt generated. "
                 f"Total: ${payment_result['total']:.2f}"
             )
-            self.order.rollback()
             self.refresh_order_panel()
             messagebox.showinfo("Receipt", receipt_text)
         except (ValueError, PaymentError) as exc:
