@@ -156,6 +156,8 @@ class PaymentProcessor:
         """Settle a payment or roll back the order when it cannot be completed."""
         try:
             totals = self.calculate_order_total(order)
+            if not order.items:
+                raise ValueError("Cannot process payment for an empty order.")
             payment = money(tendered_amount)
             total = totals["total"]
 

@@ -2,11 +2,27 @@
 
 from decimal import Decimal
 
+import tkinter as tk
+from hypothesis import given, strategies as st
 import pytest
 
+from restaurant_pos.app import RestaurantPOSApp
 from restaurant_pos.menu import Menu, MenuItem, build_demo_menu
-from restaurant_pos.payments import Order, PaymentError, PaymentProcessor
+from restaurant_pos.payments import Order, PaymentError, PaymentProcessor, money
 from restaurant_pos.reporting import SalesReport
+
+
+@pytest.fixture(name="pos_app")
+def _pos_app():
+    """Create a UI instance when a display is available."""
+    try:
+        instance = RestaurantPOSApp()
+    except tk.TclError as exc:
+        pytest.skip(f"Tkinter display is unavailable: {exc}")
+    try:
+        yield instance
+    finally:
+        instance.destroy()
 
 
 def test_order_total_calculations_and_tax_logic():
@@ -53,6 +69,43 @@ def test_payment_failure_rolls_back_order():
     assert order.paid is False
 
 
+def test_payment_accepts_exact_amount_and_returns_zero_change():
+    """Mark an order paid when tendered cash exactly matches the total."""
+    menu = build_demo_menu()
+    order = Order()
+    order.add_item(menu.get_item("SODA"))
+    processor = PaymentProcessor()
+
+    result = processor.process_payment(order, Decimal("2.70"))
+
+    assert result["status"] == "paid"
+    assert result["change"] == Decimal("0.00")
+    assert order.paid is True
+
+
+def test_payment_returns_change_for_overpayment():
+    """Return the correct change for cash above the order total."""
+    menu = build_demo_menu()
+    order = Order()
+    order.add_item(menu.get_item("SODA"))
+    processor = PaymentProcessor()
+
+    result = processor.process_payment(order, Decimal("5.00"))
+
+    assert result["change"] == Decimal("2.30")
+    assert order.paid is True
+
+
+def test_payment_rejects_empty_order():
+    """Do not settle a payment when there are no order items."""
+    order = Order()
+
+    with pytest.raises(ValueError, match="empty order"):
+        PaymentProcessor().process_payment(order, Decimal("10.00"))
+
+    assert order.paid is False
+
+
 def test_receipt_formatting_contains_totals_and_items():
     """Include item names and totals in the generated receipt."""
     menu = build_demo_menu()
@@ -67,6 +120,31 @@ def test_receipt_formatting_contains_totals_and_items():
     assert "House Soda" in receipt
     assert "Total:" in receipt
     assert "$17.50" in receipt
+
+
+def test_order_merges_duplicate_items_and_resets_discount_when_cleared():
+    """Merge repeated menu selections and reset all order state on clear."""
+    menu = build_demo_menu()
+    order = Order()
+    order.add_item(menu.get_item("SODA"))
+    order.add_item(menu.get_item("SODA"), 2)
+    order.apply_discount(10)
+
+    assert len(order.items) == 1
+    assert order.items[0].quantity == 3
+
+    order.rollback()
+    assert not order.items
+    assert order.discount_percentage == Decimal("0")
+    assert order.paid is False
+
+
+def test_empty_order_receipt_is_explicit():
+    """Explain that an empty order has no items while retaining totals."""
+    receipt = Order().receipt()
+
+    assert "No items in the order." in receipt
+    assert "Total: $0.00" in receipt
 
 
 def test_menu_rejects_invalid_items_and_duplicate_skus():
@@ -121,3 +199,68 @@ def test_sales_report_rejects_empty_orders():
     """Do not include empty orders in sales reporting."""
     with pytest.raises(ValueError):
         SalesReport().add_order(Order())
+
+
+@given(
+    st.decimals(min_value="0", max_value="10000", places=4, allow_nan=False, allow_infinity=False)
+)
+def test_money_is_idempotent_for_finite_nonnegative_values(value):
+    """Rounding an already rounded monetary value does not change it."""
+    rounded = money(value)
+
+    assert money(rounded) == rounded
+
+
+@given(st.decimals(min_value="0", max_value="100", places=4, allow_nan=False))
+def test_discount_math_never_exceeds_subtotal(percentage):
+    """Discount calculations remain bounded for every valid percentage."""
+    order = Order(tax_rate=0)
+    order.add_item(MenuItem("TEST", "Test item", "Test", 10.00, stock=1))
+    order.apply_discount(percentage)
+
+    totals = order.calculate_totals()
+
+    assert Decimal("0.00") <= totals["discount_amount"] <= totals["subtotal"]
+    assert totals["discounted_subtotal"] + totals["discount_amount"] == totals["subtotal"]
+
+
+def test_app_starts_without_crashing(pos_app):
+    """Initialize the complete desktop application successfully."""
+    assert pos_app.title() == "QuickServe POS"
+
+
+def test_clicking_menu_button_adds_item(pos_app):
+    """Connect a rendered menu button to order state."""
+    pos_app.menu_buttons[0].invoke()
+
+    assert len(pos_app.order.items) == 1
+    assert pos_app.order.items[0].quantity == 1
+
+
+def test_checkout_with_valid_cash_updates_status(pos_app, monkeypatch):
+    """Complete a cash checkout and update the status message."""
+    pos_app.menu_buttons[0].invoke()
+    pos_app.payment_entry.delete(0, tk.END)
+    pos_app.payment_entry.insert(0, "20.00")
+    monkeypatch.setattr("restaurant_pos.app.messagebox.showinfo", lambda *args: None)
+
+    pos_app.checkout()
+
+    assert pos_app.status_var.get().startswith("Payment successful.")
+    assert not pos_app.order.items
+
+
+def test_invalid_numeric_input_shows_payment_error(pos_app, monkeypatch):
+    """Show a payment error instead of raising for invalid cash input."""
+    errors: list[str] = []
+    monkeypatch.setattr(
+        "restaurant_pos.app.messagebox.showerror",
+        lambda _title, message: errors.append(message),
+    )
+    pos_app.payment_entry.delete(0, tk.END)
+    pos_app.payment_entry.insert(0, "not-a-number")
+
+    pos_app.checkout()
+
+    assert errors == ["could not convert string to float: 'not-a-number'"]
+    assert "could not convert" in pos_app.status_var.get()
