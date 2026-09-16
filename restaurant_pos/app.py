@@ -30,10 +30,10 @@ class RestaurantPOSApp(tk.Tk):
 
     def build_ui(self) -> None:
         """Construct the menu, order, payment, and status controls."""
-        self.frame = tk.Frame(self, padx=18, pady=18, bg="#f4f7fb")
-        self.frame.pack(fill=tk.BOTH, expand=True)
+        self.root_frame = tk.Frame(self, padx=18, pady=18, bg="#f4f7fb")
+        self.root_frame.pack(fill=tk.BOTH, expand=True)
 
-        self.menu_panel = tk.Frame(self.frame, bg="#ffffff", bd=1, relief=tk.SOLID)
+        self.menu_panel = tk.Frame(self.root_frame, bg="#ffffff", bd=1, relief=tk.SOLID)
         self.menu_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 16))
 
         tk.Label(
@@ -43,14 +43,17 @@ class RestaurantPOSApp(tk.Tk):
             bg="#ffffff",
         ).pack(pady=(12, 6))
 
-        self.menu_buttons = []
+        self.menu_buttons: list[tk.Button] = []
         for item in self.menu.list_items():
+            def add_selected_item(sku: str = item.sku) -> None:
+                self.add_item_to_order(sku)
+
             button = tk.Button(
                 self.menu_panel,
                 text=f"{item.name} - ${item.price:.2f}",
                 width=22,
                 height=2,
-                command=lambda sku=item.sku: self.add_item_to_order(sku),
+                command=add_selected_item,
                 bg="#dfeaff",
                 fg="#183153",
                 font=("Segoe UI", 10, "bold"),
@@ -58,7 +61,7 @@ class RestaurantPOSApp(tk.Tk):
             button.pack(pady=4, padx=12, fill=tk.X)
             self.menu_buttons.append(button)
 
-        self.order_panel = tk.Frame(self.frame, bg="#ffffff", bd=1, relief=tk.SOLID)
+        self.order_panel = tk.Frame(self.root_frame, bg="#ffffff", bd=1, relief=tk.SOLID)
         self.order_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         tk.Label(
@@ -145,7 +148,7 @@ class RestaurantPOSApp(tk.Tk):
         self.status_var = tk.StringVar(value="Ready for service.")
         self.sales_var = tk.StringVar(value="Today's sales: $0.00")
         tk.Label(
-            self.frame,
+            self.root_frame,
             textvariable=self.sales_var,
             bg="#f4f7fb",
             fg="#314f74",
@@ -154,7 +157,7 @@ class RestaurantPOSApp(tk.Tk):
             wraplength=260,
         ).pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 0))
         tk.Label(
-            self.frame,
+            self.root_frame,
             textvariable=self.status_var,
             bg="#f4f7fb",
             fg="#314f74",

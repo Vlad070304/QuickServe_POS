@@ -26,8 +26,30 @@ python main.py
 ## Run tests
 
 ```bash
-pytest -q
+python -m pytest --cov=restaurant_pos --cov-report=term-missing
 ```
+
+Development dependencies are listed in `requirements-dev.txt`. Install them with:
+
+```bash
+python -m pip install -r requirements-dev.txt
+pre-commit install
+```
+
+Run the complete local quality gate before opening a pull request:
+
+```bash
+python scripts/release_check.py
+```
+
+This checks syntax compilation, Ruff linting, mypy typing, pytest coverage
+(with a 70% minimum for the testable business-logic modules), and application
+startup. The same checks run automatically on every push and pull request in
+GitHub Actions. On Linux, the CI smoke test uses `xvfb-run` for Tkinter's
+display requirement.
+
+The `Makefile` provides equivalent shortcuts such as `make test`, `make check`,
+and `make release-check`.
 
 ## QA checklist
 

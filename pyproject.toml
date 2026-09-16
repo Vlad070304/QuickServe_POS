@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quickserve-pos"
+version = "0.1.0"
+description = "A desktop point-of-sale application for restaurant ordering."
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers"
+
+[tool.coverage.run]
+branch = true
+source = ["restaurant_pos"]
+omit = ["restaurant_pos/app.py"]
+
+[tool.coverage.report]
+fail_under = 70
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["restaurant_pos"]
+check_untyped_defs = true
+warn_unused_ignores = true
+no_implicit_optional = true
+exclude = "(^tests/|^scripts/)"

@@ -4,8 +4,9 @@ from decimal import Decimal
 
 import pytest
 
-from restaurant_pos.menu import build_demo_menu
+from restaurant_pos.menu import Menu, MenuItem, build_demo_menu
 from restaurant_pos.payments import Order, PaymentError, PaymentProcessor
+from restaurant_pos.reporting import SalesReport
 
 
 def test_order_total_calculations_and_tax_logic():
@@ -66,3 +67,57 @@ def test_receipt_formatting_contains_totals_and_items():
     assert "House Soda" in receipt
     assert "Total:" in receipt
     assert "$17.50" in receipt
+
+
+def test_menu_rejects_invalid_items_and_duplicate_skus():
+    """Reject invalid menu data and duplicate registrations."""
+    with pytest.raises(ValueError):
+        MenuItem("BAD", "Invalid", "Main", -1)
+    with pytest.raises(ValueError):
+        MenuItem("BAD", "Invalid", "Main", 1, stock=-1)
+
+    menu = Menu()
+    item = MenuItem("ITEM", "Item", "Main", 1, stock=2)
+    menu.add_item(item)
+    with pytest.raises(ValueError):
+        menu.add_item(item)
+    with pytest.raises(KeyError):
+        menu.get_item("MISSING")
+
+
+def test_menu_updates_and_removes_stock():
+    """Adjust inventory and reject changes that would create negative stock."""
+    menu = Menu()
+    menu.add_item(MenuItem("ITEM", "Item", "Main", 1, stock=2))
+
+    menu.update_stock("ITEM", 3)
+    assert menu.get_item("ITEM").stock == 5
+    with pytest.raises(ValueError):
+        menu.update_stock("ITEM", -6)
+
+    menu.remove_item("ITEM")
+    menu.clear()
+    assert menu.list_items() == []
+
+
+def test_sales_report_summarizes_revenue_and_items():
+    """Aggregate revenue and item quantities across completed orders."""
+    menu = build_demo_menu()
+    report = SalesReport()
+    first_order = Order()
+    first_order.add_item(menu.get_item("SODA"), 2)
+    second_order = Order()
+    second_order.add_item(menu.get_item("PASTA"))
+
+    report.add_order(first_order)
+    report.add_order(second_order)
+
+    assert report.total_revenue() == Decimal("21.60")
+    assert report.items_sold() == {"House Soda": 2, "Chef Pasta": 1}
+    assert "Daily Sales Summary" in report.summary_text()
+
+
+def test_sales_report_rejects_empty_orders():
+    """Do not include empty orders in sales reporting."""
+    with pytest.raises(ValueError):
+        SalesReport().add_order(Order())
