@@ -338,8 +338,8 @@ def test_invalid_numeric_input_shows_payment_error(pos_app, monkeypatch):
 
     pos_app.checkout()
 
-    assert errors == ["could not convert string to float: 'not-a-number'"]
-    assert "could not convert" in pos_app.status_var.get()
+    assert errors == ["Cash amount must be a valid number."]
+    assert "Cash amount must be a valid number." in pos_app.status_var.get()
 
 
 def test_demo_seed_and_menu_sales_exports(tmp_path):
