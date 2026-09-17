@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tkinter as tk
+import os
 from tkinter import messagebox, filedialog, simpledialog
 from decimal import Decimal
 from pathlib import Path
@@ -12,6 +13,7 @@ from .payments import Order, PaymentError, PaymentProcessor
 from .reporting import SalesReport
 from .services import CheckoutService
 from .admin import AdminControls
+from .operations import SalesBackupScheduler
 
 
 class RestaurantPOSApp(tk.Tk):
@@ -32,15 +34,55 @@ class RestaurantPOSApp(tk.Tk):
         self.order = Order()
         self.processor = PaymentProcessor(tax_rate=0.08)
         self.sales_report = SalesReport(db_path)
+        self.backup_scheduler = None
+        backup_path = os.getenv("QUICKSERVE_BACKUP_PATH")
+        if db_path is not None and backup_path:
+            if self.sales_report.store is None:
+                raise RuntimeError("Persistent sales storage is required for backups.")
+            interval = float(os.getenv("QUICKSERVE_BACKUP_INTERVAL", "300"))
+            if interval <= 0:
+                raise ValueError("QUICKSERVE_BACKUP_INTERVAL must be greater than zero.")
+            self.backup_scheduler = SalesBackupScheduler(
+                self.sales_report.store, backup_path,
+                interval,
+                on_error=lambda exc: self.status_var.set(f"Backup error: {exc}"),
+            )
+            self.backup_scheduler.start()
         self.checkout_service = CheckoutService(
             self.menu,
             self.processor,
             self.sales_report,
         )
         self.admin = AdminControls(self.menu, self.processor)
+        self.order_panel: tk.Frame
+        self.order_listbox: tk.Listbox
+        self.summary_frame: tk.Frame
+        self.subtotal_var: tk.StringVar
+        self.tax_var: tk.StringVar
+        self.total_var: tk.StringVar
+        self.controls: tk.Frame
+        self.payment_entry: tk.Entry
+        self.discount_button: tk.Button
+        self.clear_button: tk.Button
+        self.checkout_button: tk.Button
+        self.customer_entry: tk.Entry
+        self.split_cash_entry: tk.Entry
+        self.split_card_entry: tk.Entry
+        self.status_var: tk.StringVar
+        self.sales_var: tk.StringVar
 
         self.build_ui()
         self.refresh_order_panel()
+
+    def destroy(self) -> None:
+        """Stop background work before closing the Tk application."""
+        if self.backup_scheduler is not None:
+            self.backup_scheduler.stop()
+        if self.menu.store is not None:
+            self.menu.store.close()
+        if self.sales_report.store is not None and self.sales_report.store is not self.menu.store:
+            self.sales_report.store.close()
+        super().destroy()
 
     def build_ui(self) -> None:
         """Construct the menu, order, payment, and status controls."""
@@ -67,6 +109,7 @@ class RestaurantPOSApp(tk.Tk):
         self.menu_buttons.clear()
         for item in self.menu.list_items():
             def add_selected_item(sku: str = item.sku) -> None:
+                """Add the selected menu item to the current order."""
                 self.add_item_to_order(sku)
 
             button = tk.Button(
@@ -178,8 +221,11 @@ class RestaurantPOSApp(tk.Tk):
             row=5, column=0, columnspan=2, sticky="ew")
         tk.Button(self.controls, text="Export CSV", command=self.export_report).grid(
             row=6, column=0, sticky="ew")
-        tk.Button(self.controls, text="Receipt PDF / Kitchen Ticket", command=self.export_receipts).grid(
-            row=6, column=1, sticky="ew")
+        tk.Button(
+            self.controls,
+            text="Receipt PDF / Kitchen Ticket",
+            command=self.export_receipts,
+        ).grid(row=6, column=1, sticky="ew")
         tk.Button(self.controls, text="Admin: Set Tax", command=self.set_tax).grid(
             row=7, column=0, columnspan=2, sticky="ew")
         tk.Button(self.controls, text="Admin: Add Item", command=self.add_menu_item).grid(
@@ -268,6 +314,7 @@ class RestaurantPOSApp(tk.Tk):
             messagebox.showerror("Payment Error", str(exc))
 
     def set_tax(self) -> None:
+        """Prompt for and apply a new tax rate."""
         value = simpledialog.askfloat("Admin Tax", "Tax rate (e.g. 0.08):",
                                       initialvalue=float(self.processor.tax_rate))
         if value is not None:
@@ -317,11 +364,13 @@ class RestaurantPOSApp(tk.Tk):
             messagebox.showerror("Payment Error", str(exc))
 
     def export_report(self) -> None:
+        """Prompt for a destination and export sales data as CSV."""
         path = filedialog.asksaveasfilename(defaultextension=".csv")
         if path:
             self.sales_report.export_csv(path)
 
     def export_receipts(self) -> None:
+        """Save the active receipt as PDF and display its kitchen ticket."""
         if not self.order.items:
             messagebox.showinfo("Receipt", "Complete an order first.")
             return

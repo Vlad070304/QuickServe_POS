@@ -31,6 +31,25 @@ A desktop point-of-sale application built with Python and Tkinter for fast resta
 python main.py
 ```
 
+For local development, `make start` (or `python scripts/start_dev.py`) starts
+the app against `quickserve-dev.db`. A new database is automatically seeded
+with the demo menu; existing data is never overwritten. Set `QUICKSERVE_DB`
+to use another database path.
+
+Menu and completed sales can be transferred without opening SQLite directly:
+
+```bash
+python -c "from restaurant_pos.operations import export_menu; export_menu('quickserve-dev.db', 'menu.csv')"
+python -c "from restaurant_pos.operations import import_menu; import_menu('quickserve-dev.db', 'menu.csv')"
+python -c "from restaurant_pos.operations import export_sales; export_sales('quickserve-dev.db', 'sales.csv')"
+python -c "from restaurant_pos.operations import import_sales; import_sales('quickserve-dev.db', 'sales.csv')"
+```
+
+`SalesBackupScheduler` in `restaurant_pos.operations` provides consistent
+background SQLite backups. It reports filesystem/database errors through its
+`on_error` callback rather than hiding failures. Payment input is validated
+before settlement and invalid or insufficient tenders leave the order unpaid.
+
 ## Run tests
 
 ```bash

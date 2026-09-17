@@ -1,5 +1,6 @@
 """Tests for the QuickServe POS business logic."""
 
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import tkinter as tk
@@ -11,7 +12,9 @@ from restaurant_pos.menu import Menu, MenuItem, build_demo_menu
 from restaurant_pos.payments import Order, PaymentError, PaymentProcessor, money
 from restaurant_pos.reporting import SalesReport
 from restaurant_pos.services import CheckoutService
-from datetime import datetime, timezone
+from restaurant_pos.operations import (
+    export_menu, export_sales, import_menu, import_sales, seed_demo_data,
+)
 
 
 @pytest.fixture(name="pos_app")
@@ -337,3 +340,43 @@ def test_invalid_numeric_input_shows_payment_error(pos_app, monkeypatch):
 
     assert errors == ["could not convert string to float: 'not-a-number'"]
     assert "could not convert" in pos_app.status_var.get()
+
+
+def test_demo_seed_and_menu_sales_exports(tmp_path):
+    """Seed a new database and transfer menu and sales data through CSV."""
+    db_path = tmp_path / "demo.db"
+    assert seed_demo_data(db_path) == 5
+    assert seed_demo_data(db_path) == 0
+    menu_csv = tmp_path / "menu.csv"
+    export_menu(db_path, menu_csv)
+    imported_db = tmp_path / "imported.db"
+    assert import_menu(imported_db, menu_csv) == 5
+    imported_menu = Menu(imported_db)
+    assert len(imported_menu.list_items()) == 5
+    assert imported_menu.store is not None
+    imported_menu.store.close()
+
+    report = SalesReport(db_path)
+    order = Order(tax_rate=0)
+    source_menu = Menu(db_path)
+    order.add_item(source_menu.get_item("SODA"))
+    assert source_menu.store is not None
+    source_menu.store.close()
+    report.add_order(order)
+    sales_csv = tmp_path / "sales.csv"
+    export_sales(db_path, sales_csv)
+    assert "order_number" in sales_csv.read_text(encoding="utf-8")
+    assert report.store is not None
+    report.store.close()
+    restored_db = tmp_path / "restored.db"
+    assert import_sales(restored_db, sales_csv) == 1
+
+
+def test_payment_validation_rejects_negative_tender_without_accepting_order():
+    """Reject invalid tender before marking the order paid."""
+    order = Order(tax_rate=0)
+    order.add_item(MenuItem("ITEM", "Item", "Main", 1, stock=1))
+    with pytest.raises(ValueError, match="negative"):
+        PaymentProcessor(tax_rate=0).process_payment(order, -1)
+    assert not order.paid
+    assert not order.items

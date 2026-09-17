@@ -1,7 +1,10 @@
-.PHONY: install test lint typecheck smoke check release-check
+.PHONY: install start test lint typecheck smoke check release-check
 
 install:
 	python -m pip install -r requirements-dev.txt
+
+start:
+	python scripts/start_dev.py
 
 test:
 	python -m pytest --cov=restaurant_pos --cov-report=term-missing

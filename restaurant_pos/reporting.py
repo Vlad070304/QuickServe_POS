@@ -46,8 +46,10 @@ class SalesReport:
     def daily_totals(self, on_date: date | None = None) -> dict[str, Decimal]:
         target = on_date or datetime.now().date()
         orders = [o for o in self.orders if o.created_at.date() == target]
-        return {"orders": Decimal(len(orders)),
-                "revenue": sum((o.calculate_totals()["total"] for o in orders), Decimal("0")).quantize(Decimal("0.01"))}
+        revenue = sum(
+            (o.calculate_totals()["total"] for o in orders), Decimal("0")
+        ).quantize(Decimal("0.01"))
+        return {"orders": Decimal(len(orders)), "revenue": revenue}
 
     def best_sellers(self, limit: int | None = None) -> dict[str, int]:
         result = dict(sorted(self.items_sold().items(), key=lambda pair: (-pair[1], pair[0])))
@@ -64,7 +66,11 @@ class SalesReport:
         original = next((o for o in self.orders if o.order_number == order_number), None)
         if original is None:
             raise KeyError(order_number)
-        refund_amount = Decimal(str(amount)) if amount is not None else original.calculate_totals()["total"]
+        refund_amount = (
+            Decimal(str(amount))
+            if amount is not None
+            else original.calculate_totals()["total"]
+        )
         if refund_amount <= 0 or refund_amount > original.calculate_totals()["total"]:
             raise ValueError("Refund amount is outside the order total.")
         self._refunds = getattr(self, "_refunds", [])

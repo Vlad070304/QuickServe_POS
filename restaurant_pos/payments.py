@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
 from typing import List, Mapping
 from pathlib import Path
 from datetime import datetime, timezone
@@ -152,7 +152,8 @@ class Order:
         objects = [
             b"<< /Type /Catalog /Pages 2 0 R >>",
             b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 800] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 800] "
+            b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
             b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
             b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
         ]
@@ -164,7 +165,11 @@ class Order:
         xref = len(pdf)
         pdf.extend(f"xref\n0 {len(objects)+1}\n0000000000 65535 f \n".encode())
         pdf.extend(b"".join(f"{offset:010d} 00000 n \n".encode() for offset in offsets))
-        pdf.extend(f"trailer << /Size {len(objects)+1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF".encode())
+        trailer = (
+            f"trailer << /Size {len(objects)+1} /Root 1 0 R >>\n"
+            f"startxref\n{xref}\n%%EOF"
+        )
+        pdf.extend(trailer.encode())
         Path(path).write_bytes(pdf)
 
     def print_thermal(self, printer=None) -> str:
@@ -193,6 +198,20 @@ class PaymentProcessor:
         order.tax_rate = self.tax_rate
         return order.calculate_totals()
 
+    def validate_payment(self, order: Order, tendered_amount: float | Decimal) -> Decimal:
+        """Validate payment input before any payment can be accepted."""
+        if not order.items:
+            raise ValueError("Cannot process payment for an empty order.")
+        try:
+            amount = money(tendered_amount)
+        except (InvalidOperation, ValueError, TypeError) as exc:
+            raise ValueError("Payment amount must be a valid number.") from exc
+        if amount < 0:
+            raise ValueError("Payment amount cannot be negative.")
+        if amount < self.calculate_order_total(order)["total"]:
+            raise ValueError("Insufficient payment to cover the order total.")
+        return amount
+
     def process_payment(
         self,
         order: Order,
@@ -204,16 +223,10 @@ class PaymentProcessor:
         """Settle a payment or roll back the order when it cannot be completed."""
         try:
             totals = self.calculate_order_total(order)
-            if not order.items:
-                raise ValueError("Cannot process payment for an empty order.")
-            payment = money(tendered_amount)
-            total = totals["total"]
-
             if trigger_failure:
                 raise PaymentError("Card declined. The transaction was rolled back.")
-            if payment < total:
-                raise ValueError("Insufficient payment to cover the order total.")
-
+            payment = self.validate_payment(order, tendered_amount)
+            total = totals["total"]
             change = (payment - total).quantize(CENT, rounding=ROUND_HALF_UP)
             order.paid = True
             return {
@@ -230,20 +243,24 @@ class PaymentProcessor:
     def process_split_payment(self, order: Order,
                               tenders: Mapping[str, float | Decimal]) -> dict:
         """Accept multiple partial tenders (for example cash plus card)."""
-        totals = self.calculate_order_total(order)
-        if not order.items:
-            raise ValueError("Cannot process payment for an empty order.")
-        normalized = {name: money(value) for name, value in tenders.items()}
-        if any(amount < 0 for amount in normalized.values()):
-            raise ValueError("Payment amounts cannot be negative.")
-        paid = sum(normalized.values(), Decimal("0"))
-        if paid < totals["total"]:
-            raise ValueError("Insufficient payment to cover the order total.")
-        order.paid = True
-        return {
-            "status": "paid", "total": totals["total"],
-            "change": money(paid - totals["total"]),
-            "payments": [{"method": name, "amount": amount}
-                         for name, amount in normalized.items() if amount],
-            "receipt": order.receipt(),
-        }
+        try:
+            totals = self.calculate_order_total(order)
+            if not order.items:
+                raise ValueError("Cannot process payment for an empty order.")
+            normalized = {name: money(value) for name, value in tenders.items()}
+            if any(amount < 0 for amount in normalized.values()):
+                raise ValueError("Payment amounts cannot be negative.")
+            paid = sum(normalized.values(), Decimal("0"))
+            if paid < totals["total"]:
+                raise ValueError("Insufficient payment to cover the order total.")
+            order.paid = True
+            return {
+                "status": "paid", "total": totals["total"],
+                "change": money(paid - totals["total"]),
+                "payments": [{"method": name, "amount": amount}
+                             for name, amount in normalized.items() if amount],
+                "receipt": order.receipt(),
+            }
+        except (InvalidOperation, TypeError, ValueError):
+            order.rollback()
+            raise

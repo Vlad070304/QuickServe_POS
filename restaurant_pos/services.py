@@ -44,8 +44,11 @@ class CheckoutService:
     ) -> dict[str, Any]:
         """Settle an order, update inventory, and record the completed sale."""
         self._validate_stock(order)
-        result = (self.processor.process_split_payment(order, tenders)
-                  if tenders is not None else self.processor.process_payment(order, tendered_amount))
+        result = (
+            self.processor.process_split_payment(order, tenders)
+            if tenders is not None
+            else self.processor.process_payment(order, tendered_amount)
+        )
         self._decrement_stock(order)
         self.sales_report.last_payment = result.get("payments", [])
         self.sales_report.add_order(self._copy_order(order))

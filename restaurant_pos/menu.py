@@ -98,6 +98,8 @@ class Menu:
     def clear(self) -> None:
         """Remove all menu items."""
         self._items.clear()
+        if self.store:
+            self.store.clear_menu()
 
 
 def build_demo_menu() -> Menu:
