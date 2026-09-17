@@ -6,6 +6,7 @@ from .reporting import SalesReport
 from .services import CheckoutService
 from .storage import SQLiteStore
 from .admin import AdminControls
+from .admin import StaffRole
 
 __all__ = [
     "Menu",
@@ -18,4 +19,5 @@ __all__ = [
     "CheckoutService",
     "SQLiteStore",
     "AdminControls",
+    "StaffRole",
 ]

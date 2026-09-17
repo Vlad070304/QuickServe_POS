@@ -15,6 +15,7 @@ from restaurant_pos.services import CheckoutService
 from restaurant_pos.operations import (
     export_menu, export_sales, import_menu, import_sales, seed_demo_data,
 )
+from restaurant_pos.admin import AdminControls, StaffRole
 
 
 @pytest.fixture(name="pos_app")
@@ -380,3 +381,18 @@ def test_payment_validation_rejects_negative_tender_without_accepting_order():
         PaymentProcessor(tax_rate=0).process_payment(order, -1)
     assert not order.paid
     assert not order.items
+
+
+def test_staff_roles_protect_administration_controls():
+    """Prevent cashiers from changing tax or menu configuration."""
+    menu = Menu()
+    processor = PaymentProcessor()
+    cashier = AdminControls(menu, processor, role=StaffRole.CASHIER)
+
+    with pytest.raises(PermissionError, match="Manager or administrator"):
+        cashier.set_tax_rate(0.05)
+    with pytest.raises(PermissionError, match="Manager or administrator"):
+        cashier.create_menu_item(MenuItem("ITEM", "Item", "Main", 1, stock=1))
+
+    manager = AdminControls(menu, processor, role="manager")
+    assert manager.set_tax_rate(0.05) == Decimal("0.05")

@@ -11,6 +11,7 @@ A desktop point-of-sale application built with Python and Tkinter for fast resta
 - Persistent order history with order numbers, customer names, timestamps, and search
 - Cash/card split payments and configurable tax administration
 - Menu administration, time-based discounts, refunds, sales reports, and CSV export
+- Role-based staff access for cashier, manager, and administrator workflows
 - Receipt generation for customer checkout
 - PDF receipts, thermal-printer output, and separate kitchen tickets
 - Sales summary logic for reporting and auditing
@@ -49,6 +50,8 @@ python -c "from restaurant_pos.operations import import_sales; import_sales('qui
 background SQLite backups. It reports filesystem/database errors through its
 `on_error` callback rather than hiding failures. Payment input is validated
 before settlement and invalid or insufficient tenders leave the order unpaid.
+Pass `staff_role="cashier"`, `"manager"`, or `"admin"` to `RestaurantPOSApp`
+to restrict administrative controls for different staff workflows.
 
 ## Run tests
 

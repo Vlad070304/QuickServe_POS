@@ -12,7 +12,7 @@ from .menu import MenuItem, build_demo_menu
 from .payments import Order, PaymentError, PaymentProcessor
 from .reporting import SalesReport
 from .services import CheckoutService
-from .admin import AdminControls
+from .admin import AdminControls, StaffRole
 from .operations import SalesBackupScheduler
 
 COLORS = {
@@ -30,7 +30,11 @@ COLORS = {
 class RestaurantPOSApp(tk.Tk):
     """Provide the graphical user interface for the restaurant POS."""
 
-    def __init__(self, db_path: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        db_path: str | Path | None = None,
+        staff_role: StaffRole | str = StaffRole.ADMIN,
+    ) -> None:
         """Initialize the application state and widgets."""
         super().__init__()
         self.title("QuickServe POS")
@@ -65,7 +69,7 @@ class RestaurantPOSApp(tk.Tk):
             self.processor,
             self.sales_report,
         )
-        self.admin = AdminControls(self.menu, self.processor)
+        self.admin = AdminControls(self.menu, self.processor, role=staff_role)
         self.order_panel: tk.Frame
         self.order_listbox: tk.Listbox
         self.summary_frame: tk.Frame
@@ -80,10 +84,15 @@ class RestaurantPOSApp(tk.Tk):
         self.customer_entry: tk.Entry
         self.split_cash_entry: tk.Entry
         self.split_card_entry: tk.Entry
+        self.tax_button: tk.Button
+        self.add_item_button: tk.Button
+        self.remove_item_button: tk.Button
         self.status_var: tk.StringVar
         self.order_summary_var: tk.StringVar
         self.sales_var: tk.StringVar
+        self.role_var: tk.StringVar
         self.order_summary_var = tk.StringVar(value="Cart is empty")
+        self.role_var = tk.StringVar(value=f"Role: {self.admin.role.value.title()}")
 
         self.build_ui()
         self._bind_shortcuts()
@@ -258,12 +267,25 @@ class RestaurantPOSApp(tk.Tk):
             text="Receipt PDF / Kitchen Ticket",
             command=self.export_receipts,
         ).grid(row=6, column=1, sticky="ew")
-        tk.Button(self.controls, text="Admin: Set Tax", command=self.set_tax).grid(
+        self.tax_button = tk.Button(self.controls, text="Admin: Set Tax", command=self.set_tax)
+        self.tax_button.grid(
             row=7, column=0, columnspan=2, sticky="ew")
-        tk.Button(self.controls, text="Admin: Add Item", command=self.add_menu_item).grid(
+        self.add_item_button = tk.Button(
+            self.controls, text="Admin: Add Item", command=self.add_menu_item)
+        self.add_item_button.grid(
             row=8, column=0, sticky="ew")
-        tk.Button(self.controls, text="Admin: Remove Item", command=self.remove_menu_item).grid(
+        self.remove_item_button = tk.Button(
+            self.controls, text="Admin: Remove Item", command=self.remove_menu_item)
+        self.remove_item_button.grid(
             row=8, column=1, sticky="ew")
+        ttk.Label(
+            self.controls,
+            textvariable=self.role_var,
+            style="POS.TLabel",
+        ).grid(row=9, column=0, columnspan=2, sticky="w")
+        if self.admin.role == StaffRole.CASHIER:
+            for button in (self.tax_button, self.add_item_button, self.remove_item_button):
+                button.configure(state=tk.DISABLED)
 
         self.status_var = tk.StringVar(value="Ready for service.")
         self.sales_var = tk.StringVar(value="Today's sales: $0.00")
