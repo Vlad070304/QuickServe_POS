@@ -3,33 +3,41 @@
 from __future__ import annotations
 
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, filedialog, simpledialog
+from decimal import Decimal
+from pathlib import Path
 
-from .menu import build_demo_menu
+from .menu import MenuItem, build_demo_menu
 from .payments import Order, PaymentError, PaymentProcessor
 from .reporting import SalesReport
 from .services import CheckoutService
+from .admin import AdminControls
 
 
 class RestaurantPOSApp(tk.Tk):
     """Provide the graphical user interface for the restaurant POS."""
 
-    def __init__(self) -> None:
+    def __init__(self, db_path: str | Path | None = None) -> None:
         """Initialize the application state and widgets."""
         super().__init__()
         self.title("QuickServe POS")
         self.geometry("980x620")
         self.configure(bg="#f4f7fb")
 
-        self.menu = build_demo_menu()
+        self.menu = build_demo_menu() if db_path is None else __import__(
+            "restaurant_pos.menu", fromlist=["Menu"]).Menu(db_path)
+        if db_path is not None and not self.menu.list_items():
+            for item in build_demo_menu().list_items():
+                self.menu.add_item(item)
         self.order = Order()
         self.processor = PaymentProcessor(tax_rate=0.08)
-        self.sales_report = SalesReport()
+        self.sales_report = SalesReport(db_path)
         self.checkout_service = CheckoutService(
             self.menu,
             self.processor,
             self.sales_report,
         )
+        self.admin = AdminControls(self.menu, self.processor)
 
         self.build_ui()
         self.refresh_order_panel()
@@ -50,6 +58,13 @@ class RestaurantPOSApp(tk.Tk):
         ).pack(pady=(12, 6))
 
         self.menu_buttons: list[tk.Button] = []
+        self.refresh_menu_panel()
+
+    def refresh_menu_panel(self) -> None:
+        """Refresh menu buttons after administrator inventory changes."""
+        for button in self.menu_buttons:
+            button.destroy()
+        self.menu_buttons.clear()
         for item in self.menu.list_items():
             def add_selected_item(sku: str = item.sku) -> None:
                 self.add_item_to_order(sku)
@@ -150,6 +165,27 @@ class RestaurantPOSApp(tk.Tk):
             font=("Segoe UI", 10, "bold"),
         )
         self.checkout_button.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.customer_entry = tk.Entry(self.controls, width=18)
+        self.customer_entry.insert(0, "")
+        self.customer_entry.grid(row=3, column=0, columnspan=2, pady=(8, 0), sticky="ew")
+        self.split_cash_entry = tk.Entry(self.controls, width=8)
+        self.split_card_entry = tk.Entry(self.controls, width=8)
+        self.split_cash_entry.insert(0, "0")
+        self.split_card_entry.insert(0, "0")
+        self.split_cash_entry.grid(row=4, column=0, sticky="ew")
+        self.split_card_entry.grid(row=4, column=1, sticky="ew")
+        tk.Button(self.controls, text="Split Cash + Card", command=self.split_checkout).grid(
+            row=5, column=0, columnspan=2, sticky="ew")
+        tk.Button(self.controls, text="Export CSV", command=self.export_report).grid(
+            row=6, column=0, sticky="ew")
+        tk.Button(self.controls, text="Receipt PDF / Kitchen Ticket", command=self.export_receipts).grid(
+            row=6, column=1, sticky="ew")
+        tk.Button(self.controls, text="Admin: Set Tax", command=self.set_tax).grid(
+            row=7, column=0, columnspan=2, sticky="ew")
+        tk.Button(self.controls, text="Admin: Add Item", command=self.add_menu_item).grid(
+            row=8, column=0, sticky="ew")
+        tk.Button(self.controls, text="Admin: Remove Item", command=self.remove_menu_item).grid(
+            row=8, column=1, sticky="ew")
 
         self.status_var = tk.StringVar(value="Ready for service.")
         self.sales_var = tk.StringVar(value="Today's sales: $0.00")
@@ -216,6 +252,7 @@ class RestaurantPOSApp(tk.Tk):
     def checkout(self) -> None:
         """Process the entered payment and display the resulting receipt."""
         try:
+            self.order.customer = self.customer_entry.get().strip()
             amount = float(self.payment_entry.get())
             payment_result = self.checkout_service.checkout(self.order, amount)
             receipt_text = payment_result["receipt"]
@@ -229,6 +266,69 @@ class RestaurantPOSApp(tk.Tk):
         except (ValueError, PaymentError) as exc:
             self.status_var.set(str(exc))
             messagebox.showerror("Payment Error", str(exc))
+
+    def set_tax(self) -> None:
+        value = simpledialog.askfloat("Admin Tax", "Tax rate (e.g. 0.08):",
+                                      initialvalue=float(self.processor.tax_rate))
+        if value is not None:
+            self.admin.set_tax_rate(value)
+            self.refresh_order_panel()
+
+    def add_menu_item(self) -> None:
+        """Collect and add a menu item through the administrator controls."""
+        sku = simpledialog.askstring("Admin Menu", "SKU:")
+        name = simpledialog.askstring("Admin Menu", "Name:")
+        category = simpledialog.askstring("Admin Menu", "Category:")
+        price = simpledialog.askfloat("Admin Menu", "Price:", minvalue=0)
+        stock = simpledialog.askinteger("Admin Menu", "Opening stock:", minvalue=0)
+        if sku is None or name is None or category is None or price is None or stock is None:
+            return
+        try:
+            self.admin.create_menu_item(MenuItem(sku, name, category, price, stock))
+            self.refresh_menu_panel()
+            self.status_var.set(f"Added {name} to the menu.")
+        except ValueError as exc:
+            messagebox.showerror("Menu Error", str(exc))
+
+    def remove_menu_item(self) -> None:
+        """Remove a menu item by SKU through the administrator controls."""
+        sku = simpledialog.askstring("Admin Menu", "SKU to remove:")
+        if not sku:
+            return
+        try:
+            self.admin.delete_menu_item(sku)
+            self.refresh_menu_panel()
+            self.status_var.set(f"Removed {sku} from the menu.")
+        except (KeyError, ValueError) as exc:
+            messagebox.showerror("Menu Error", str(exc))
+
+    def split_checkout(self) -> None:
+        """Checkout using cash and card partial tenders."""
+        try:
+            tenders: dict[str, float | Decimal] = {
+                "cash": float(self.split_cash_entry.get() or 0),
+                "card": float(self.split_card_entry.get() or 0),
+            }
+            result = self.checkout_service.checkout(
+                self.order, 0, tenders=tenders)
+            messagebox.showinfo("Receipt", result["receipt"])
+            self.refresh_order_panel()
+        except (ValueError, PaymentError) as exc:
+            messagebox.showerror("Payment Error", str(exc))
+
+    def export_report(self) -> None:
+        path = filedialog.asksaveasfilename(defaultextension=".csv")
+        if path:
+            self.sales_report.export_csv(path)
+
+    def export_receipts(self) -> None:
+        if not self.order.items:
+            messagebox.showinfo("Receipt", "Complete an order first.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".pdf")
+        if path:
+            self.order.save_pdf(path)
+        messagebox.showinfo("Kitchen Ticket", self.order.kitchen_ticket())
 
 
 def main() -> None:

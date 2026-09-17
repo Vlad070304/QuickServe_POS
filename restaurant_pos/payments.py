@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
-from typing import List
+from typing import List, Mapping
+from pathlib import Path
+from datetime import datetime, timezone
+from uuid import uuid4
 
 CENT = Decimal("0.01")
 
@@ -23,6 +26,7 @@ class OrderItem:
     name: str
     quantity: int
     unit_price: Decimal
+    category: str = "Uncategorized"
 
     def line_total(self) -> Decimal:
         """Return the rounded total for this line item."""
@@ -36,12 +40,16 @@ class PaymentError(RuntimeError):
 class Order:
     """Represents the current customer order."""
 
-    def __init__(self, tax_rate: float | Decimal = 0.08) -> None:
+    def __init__(self, tax_rate: float | Decimal = 0.08, *, customer: str = "",
+                 order_number: str | None = None, created_at: datetime | None = None) -> None:
         """Create an empty order with the supplied tax rate."""
         self.items: List[OrderItem] = []
         self.discount_percentage = Decimal("0")
         self.tax_rate = money(tax_rate)
         self.paid = False
+        self.order_number = order_number or uuid4().hex[:10].upper()
+        self.customer = customer
+        self.created_at = created_at or datetime.now(timezone.utc)
 
     def add_item(self, menu_item, quantity: int = 1) -> None:
         """Add a menu item quantity to the order."""
@@ -59,6 +67,7 @@ class Order:
                 name=menu_item.name,
                 quantity=quantity,
                 unit_price=money(menu_item.price),
+                category=getattr(menu_item, "category", "Uncategorized"),
             )
         )
 
@@ -127,6 +136,44 @@ class Order:
         """Return the formatted receipt text."""
         return "\n".join(self.receipt_lines())
 
+    def kitchen_ticket(self) -> str:
+        """Return a compact ticket containing only preparation details."""
+        lines = ["KITCHEN TICKET", "==============="]
+        lines.extend(f"{item.quantity} x {item.name}" for item in self.items)
+        return "\n".join(lines)
+
+    def save_pdf(self, path: str | Path) -> None:
+        """Save a dependency-free, printable PDF receipt."""
+        text = self.receipt().replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+        commands = "BT /F1 11 Tf 40 760 Td " + " ".join(
+            f"({line}) Tj 0 -16 Td" for line in text.splitlines()
+        ) + " ET"
+        stream = commands.encode("latin-1", "replace")
+        objects = [
+            b"<< /Type /Catalog /Pages 2 0 R >>",
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 800] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+            b"<< /Length " + str(len(stream)).encode() + b" >>\nstream\n" + stream + b"\nendstream",
+        ]
+        pdf = bytearray(b"%PDF-1.4\n")
+        offsets = []
+        for index, obj in enumerate(objects, 1):
+            offsets.append(len(pdf))
+            pdf.extend(f"{index} 0 obj\n".encode() + obj + b"\nendobj\n")
+        xref = len(pdf)
+        pdf.extend(f"xref\n0 {len(objects)+1}\n0000000000 65535 f \n".encode())
+        pdf.extend(b"".join(f"{offset:010d} 00000 n \n".encode() for offset in offsets))
+        pdf.extend(f"trailer << /Size {len(objects)+1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF".encode())
+        Path(path).write_bytes(pdf)
+
+    def print_thermal(self, printer=None) -> str:
+        """Return receipt text for a thermal printer callback or spooler."""
+        receipt = self.receipt()
+        if printer:
+            printer(receipt)
+        return receipt
+
     def rollback(self) -> None:
         """Clear the order and reset its payment state."""
         self.items.clear()
@@ -152,6 +199,7 @@ class PaymentProcessor:
         tendered_amount: float | Decimal,
         *,
         trigger_failure: bool = False,
+        method: str = "cash",
     ) -> dict:
         """Settle a payment or roll back the order when it cannot be completed."""
         try:
@@ -172,8 +220,30 @@ class PaymentProcessor:
                 "status": "paid",
                 "total": total,
                 "change": change,
+                "payments": [{"method": method, "amount": payment}],
                 "receipt": order.receipt(),
             }
         except (PaymentError, ValueError):
             order.rollback()
             raise
+
+    def process_split_payment(self, order: Order,
+                              tenders: Mapping[str, float | Decimal]) -> dict:
+        """Accept multiple partial tenders (for example cash plus card)."""
+        totals = self.calculate_order_total(order)
+        if not order.items:
+            raise ValueError("Cannot process payment for an empty order.")
+        normalized = {name: money(value) for name, value in tenders.items()}
+        if any(amount < 0 for amount in normalized.values()):
+            raise ValueError("Payment amounts cannot be negative.")
+        paid = sum(normalized.values(), Decimal("0"))
+        if paid < totals["total"]:
+            raise ValueError("Insufficient payment to cover the order total.")
+        order.paid = True
+        return {
+            "status": "paid", "total": totals["total"],
+            "change": money(paid - totals["total"]),
+            "payments": [{"method": name, "amount": amount}
+                         for name, amount in normalized.items() if amount],
+            "receipt": order.receipt(),
+        }

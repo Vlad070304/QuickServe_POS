@@ -7,7 +7,12 @@ A desktop point-of-sale application built with Python and Tkinter for fast resta
 - Menu cards for appetizers, mains, drinks, and sides
 - Order creation with automatic subtotal, discount, and tax handling
 - Payment processing with validation and rollback on payment failures
+- SQLite-backed menu inventory with stock decremented after successful sales
+- Persistent order history with order numbers, customer names, timestamps, and search
+- Cash/card split payments and configurable tax administration
+- Menu administration, time-based discounts, refunds, sales reports, and CSV export
 - Receipt generation for customer checkout
+- PDF receipts, thermal-printer output, and separate kitchen tickets
 - Sales summary logic for reporting and auditing
 
 ## Project layout
@@ -15,6 +20,8 @@ A desktop point-of-sale application built with Python and Tkinter for fast resta
 - `restaurant_pos/menu.py` – menu definitions and stock handling
 - `restaurant_pos/payments.py` – order totals, discounts, tax, payments, and receipts
 - `restaurant_pos/services.py` – UI-independent checkout and inventory orchestration
+- `restaurant_pos/storage.py` – SQLite persistence for inventory and completed orders
+- `restaurant_pos/admin.py` – tax and menu administration facade
 - `restaurant_pos/app.py` – Tkinter user interface
 - `tests/test_pos_system.py` – pytest coverage for totals, discounts, tax, and payment rollback
 

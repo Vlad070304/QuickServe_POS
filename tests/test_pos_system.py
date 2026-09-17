@@ -11,6 +11,7 @@ from restaurant_pos.menu import Menu, MenuItem, build_demo_menu
 from restaurant_pos.payments import Order, PaymentError, PaymentProcessor, money
 from restaurant_pos.reporting import SalesReport
 from restaurant_pos.services import CheckoutService
+from datetime import datetime, timezone
 
 
 @pytest.fixture(name="pos_app")
@@ -228,6 +229,49 @@ def test_checkout_service_rejects_order_above_available_stock():
 
     with pytest.raises(ValueError, match="Not enough stock"):
         service.add_item(order, "ITEM", 2)
+
+
+def test_split_payment_and_order_metadata_are_recorded():
+    """Accept partial tenders and retain searchable customer metadata."""
+    order = Order(tax_rate=0, customer="Ada", order_number="ORD-1",
+                  created_at=datetime(2026, 1, 2, 12, tzinfo=timezone.utc))
+    order.add_item(MenuItem("ITEM", "Test item", "Main", 10, stock=1))
+    result = PaymentProcessor(tax_rate=0).process_split_payment(
+        order, {"cash": Decimal("4"), "card": Decimal("6")})
+    report = SalesReport()
+    report.add_order(order)
+    assert result["change"] == Decimal("0.00")
+    assert report.search_orders("ord-1") == [order]
+    assert report.daily_totals(datetime(2026, 1, 2).date())["revenue"] == Decimal("10.00")
+
+
+def test_sqlite_menu_and_order_persistence(tmp_path):
+    """Persist inventory and completed orders in SQLite."""
+    path = tmp_path / "pos.db"
+    menu = Menu(path)
+    menu.add_item(MenuItem("ITEM", "Test item", "Main", 2, stock=3))
+    menu.update_stock("ITEM", -1)
+    reopened = Menu(path)
+    assert reopened.get_item("ITEM").stock == 2
+    report = SalesReport(path)
+    order = Order(tax_rate=0, customer="Sam", order_number="ORD-2")
+    order.add_item(reopened.get_item("ITEM"))
+    report.add_order(order)
+    assert report.search_history("Sam")[0]["order_number"] == "ORD-2"
+
+
+def test_reporting_refund_best_sellers_and_receipt_exports(tmp_path):
+    """Expose operational reporting and receipt output formats."""
+    report = SalesReport()
+    order = Order(tax_rate=0, order_number="ORD-3")
+    order.add_item(MenuItem("ITEM", "Test item", "Main", 2, stock=1))
+    report.add_order(order)
+    assert report.best_sellers() == {"Test item": 1}
+    assert report.category_sales() == {"Main": Decimal("2.00")}
+    assert report.refund("ORD-3") == Decimal("2.00")
+    pdf = tmp_path / "receipt.pdf"
+    order.save_pdf(pdf)
+    assert pdf.read_bytes().startswith(b"%PDF")
 
 
 @given(

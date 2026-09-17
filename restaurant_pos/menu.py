@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, List
+from pathlib import Path
+from .storage import SQLiteStore
 
 
 @dataclass(frozen=True)
@@ -27,15 +29,23 @@ class MenuItem:
 class Menu:
     """Simple in-memory menu registry."""
 
-    def __init__(self) -> None:
+    def __init__(self, db_path: str | Path | None = None) -> None:
         """Create an empty menu registry."""
         self._items: Dict[str, MenuItem] = {}
+        self.store = SQLiteStore(db_path) if db_path else None
+        if self.store:
+            for row in self.store.load_menu_items():
+                self._items[row["sku"]] = MenuItem(
+                    row["sku"], row["name"], row["category"], row["price"], row["stock"]
+                )
 
     def add_item(self, item: MenuItem) -> None:
         """Add a menu item, rejecting duplicate SKUs."""
         if item.sku in self._items:
             raise ValueError(f"Menu item with sku '{item.sku}' already exists.")
         self._items[item.sku] = item
+        if self.store:
+            self.store.save_menu_item(item.sku, item.name, item.category, item.price, item.stock)
 
     def get_item(self, sku: str) -> MenuItem:
         """Return the menu item for a SKU or raise an error."""
@@ -61,10 +71,29 @@ class Menu:
             price=item.price,
             stock=new_stock,
         )
+        if self.store:
+            updated = self._items[sku]
+            self.store.save_menu_item(updated.sku, updated.name, updated.category,
+                                      updated.price, updated.stock)
+
+    def update_item(self, sku: str, **changes) -> MenuItem:
+        """Update administrator-controlled menu fields and persist them."""
+        item = self.get_item(sku)
+        updated = MenuItem(sku, changes.get("name", item.name),
+                           changes.get("category", item.category),
+                           changes.get("price", item.price),
+                           changes.get("stock", item.stock))
+        self._items[sku] = updated
+        if self.store:
+            self.store.save_menu_item(updated.sku, updated.name, updated.category,
+                                      updated.price, updated.stock)
+        return updated
 
     def remove_item(self, sku: str) -> None:
         """Remove a menu item if it exists."""
         self._items.pop(sku, None)
+        if self.store:
+            self.store.delete_menu_item(sku)
 
     def clear(self) -> None:
         """Remove all menu items."""
