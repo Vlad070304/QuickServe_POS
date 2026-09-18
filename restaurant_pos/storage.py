@@ -1,9 +1,13 @@
 """Small SQLite persistence layer used by the POS domain services."""
 from __future__ import annotations
 
-import sqlite3
-import json
 import csv
+import hashlib
+import hmac
+import json
+import secrets
+import sqlite3
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -47,6 +51,21 @@ class SQLiteStore:
             CREATE TABLE IF NOT EXISTS settings (
               key TEXT PRIMARY KEY, value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS staff_users (
+              username TEXT PRIMARY KEY, password_hash TEXT NOT NULL,
+              role TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS staff_sessions (
+              token_hash TEXT PRIMARY KEY, username TEXT NOT NULL
+                REFERENCES staff_users(username) ON DELETE CASCADE,
+              expires_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS audit_log (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              username TEXT NOT NULL, action TEXT NOT NULL,
+              details TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX IF NOT EXISTS ix_audit_log_created_at ON audit_log(created_at);
             """
         )
         self._run_migrations()
@@ -192,6 +211,92 @@ class SQLiteStore:
             self.connection.execute(
                 "INSERT INTO refunds(order_number, amount) VALUES (?, ?)",
                 (order_number, str(amount)),
+            )
+
+    def create_staff_account(
+        self,
+        username: str,
+        password: str,
+        role: str,
+        *,
+        session_token: str | None = None,
+    ) -> None:
+        """Create a staff account, requiring admin approval after bootstrap."""
+        username = username.strip()
+        if not username or not password:
+            raise ValueError("Username and password are required.")
+        if role not in {"cashier", "manager", "admin"}:
+            raise ValueError(f"Unknown staff role: {role}")
+        account_count = self.connection.execute(
+            "SELECT COUNT(*) AS count FROM staff_users"
+        ).fetchone()["count"]
+        if account_count:
+            if session_token is None:
+                raise PermissionError("An administrator session is required.")
+            _, actor_role = self.get_session_role(session_token)
+            if actor_role != "admin":
+                raise PermissionError("Administrator approval is required.")
+        salt = secrets.token_bytes(16)
+        digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 200_000)
+        encoded = f"pbkdf2_sha256$200000${salt.hex()}${digest.hex()}"
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO staff_users(username, password_hash, role) VALUES (?, ?, ?)",
+                (username, encoded, role),
+            )
+
+    def authenticate_staff(self, username: str, password: str, *, ttl: int = 28800) -> str:
+        """Verify credentials and create a time-limited opaque session token."""
+        row = self.connection.execute(
+            "SELECT password_hash, role FROM staff_users "
+            "WHERE username = ? AND active = 1", (username.strip(),)
+        ).fetchone()
+        if row is None:
+            raise PermissionError("Invalid username or password.")
+        scheme, iterations, salt_hex, digest_hex = row["password_hash"].split("$")
+        if scheme != "pbkdf2_sha256":
+            raise PermissionError("Unsupported password hash.")
+        candidate = hashlib.pbkdf2_hmac(
+            "sha256", password.encode(), bytes.fromhex(salt_hex), int(iterations)
+        )
+        if not hmac.compare_digest(candidate.hex(), digest_hex):
+            raise PermissionError("Invalid username or password.")
+        token = secrets.token_urlsafe(32)
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO staff_sessions(token_hash, username, expires_at) VALUES (?, ?, ?)",
+                (hashlib.sha256(token.encode()).hexdigest(), username.strip(),
+                 time.time() + ttl),
+            )
+        return token
+
+    def get_session_role(self, token: str) -> tuple[str, str]:
+        """Return the username and role for a valid, unexpired session."""
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        row = self.connection.execute(
+            """SELECT s.username, u.role FROM staff_sessions s
+               JOIN staff_users u ON u.username = s.username
+               WHERE s.token_hash = ? AND s.expires_at > ? AND u.active = 1""",
+            (token_hash, time.time()),
+        ).fetchone()
+        if row is None:
+            raise PermissionError("A valid staff session is required.")
+        return row["username"], row["role"]
+
+    def revoke_session(self, token: str) -> None:
+        """Revoke a staff session token."""
+        with self.connection:
+            self.connection.execute(
+                "DELETE FROM staff_sessions WHERE token_hash = ?",
+                (hashlib.sha256(token.encode()).hexdigest(),),
+            )
+
+    def audit(self, username: str, action: str, details: str = "") -> None:
+        """Record a security-relevant staff action."""
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO audit_log(username, action, details) VALUES (?, ?, ?)",
+                (username, action, details),
             )
 
     def search_orders(self, query: str = "", on_date: str | None = None) -> list[sqlite3.Row]:

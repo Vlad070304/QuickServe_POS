@@ -65,8 +65,21 @@ class SalesReport:
             result[order.created_at.hour] += order.calculate_totals()["total"]
         return {hour: value.quantize(Decimal("0.01")) for hour, value in sorted(result.items())}
 
-    def refund(self, order_number: str, amount: float | Decimal | None = None) -> Decimal:
+    def refund(
+        self,
+        order_number: str,
+        amount: float | Decimal | None = None,
+        *,
+        session_token: str | None = None,
+    ) -> Decimal:
         """Record a negative sale for a full or partial refund."""
+        actor = "local"
+        if self.store:
+            if session_token is None:
+                raise PermissionError("A valid staff session is required for refunds.")
+            actor, role = self.store.get_session_role(session_token)
+            if role not in {"manager", "admin"}:
+                raise PermissionError("Manager or administrator approval is required.")
         original = next((o for o in self.orders if o.order_number == order_number), None)
         if original is None:
             raise KeyError(order_number)
@@ -81,6 +94,7 @@ class SalesReport:
         self._refunds.append(refund_amount)
         if self.store:
             self.store.save_refund(order_number, refund_amount)
+            self.store.audit(actor, "refund_issued", f"{order_number}:{refund_amount}")
         return refund_amount
 
     def category_sales(self) -> dict[str, Decimal]:
