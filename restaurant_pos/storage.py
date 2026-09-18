@@ -46,6 +46,15 @@ class SQLiteStore:
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               order_number TEXT NOT NULL REFERENCES orders(order_number),
               amount TEXT NOT NULL,
+              payment_id INTEGER,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS payments (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              order_number TEXT NOT NULL REFERENCES orders(order_number),
+              method TEXT NOT NULL, amount TEXT NOT NULL,
+              status TEXT NOT NULL, authorization_reference TEXT,
+              idempotency_key TEXT UNIQUE,
               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS settings (
@@ -69,7 +78,33 @@ class SQLiteStore:
             """
         )
         self._run_migrations()
+        self._ensure_order_lifecycle_columns()
+        self._ensure_refund_columns()
         self.connection.commit()
+
+    def _ensure_order_lifecycle_columns(self) -> None:
+        """Add payment lifecycle columns to databases created by older versions."""
+        columns = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(orders)")
+        }
+        if "payment_status" not in columns:
+            self.connection.execute(
+                "ALTER TABLE orders ADD COLUMN payment_status TEXT NOT NULL DEFAULT 'paid'"
+            )
+        if "idempotency_key" not in columns:
+            self.connection.execute("ALTER TABLE orders ADD COLUMN idempotency_key TEXT")
+            self.connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_orders_idempotency "
+                "ON orders(idempotency_key) WHERE idempotency_key IS NOT NULL"
+            )
+
+    def _ensure_refund_columns(self) -> None:
+        """Add payment linkage to refund records created by older versions."""
+        columns = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(refunds)")
+        }
+        if "payment_id" not in columns:
+            self.connection.execute("ALTER TABLE refunds ADD COLUMN payment_id INTEGER")
 
     def _run_migrations(self) -> None:
         """Apply schema changes in order so upgrades are explicit and repeatable."""
@@ -139,17 +174,23 @@ class SQLiteStore:
         self.connection.execute("DELETE FROM menu_items")
         self.connection.commit()
 
-    def save_order(self, order, payments: Iterable[dict] = ()) -> int:
+    def save_order(
+        self, order, payments: Iterable[dict] = (), *, idempotency_key: str | None = None,
+        status: str = "paid",
+    ) -> int:
         """Persist an order and its line items, returning the database ID."""
         totals = order.calculate_totals()
+        payment_records = list(payments)
         with self.connection:
             cursor = self.connection.execute(
                 "INSERT INTO orders("
                 "subtotal,tax,discount,total,payment_json,receipt,"
-                "order_number,customer,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                "order_number,customer,created_at,payment_status,idempotency_key) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (str(totals["subtotal"]), str(totals["tax"]), str(totals["discount_amount"]),
-                 str(totals["total"]), json.dumps(list(payments), default=str), order.receipt(),
-                 order.order_number, order.customer, order.created_at.isoformat()),
+                 str(totals["total"]), json.dumps(payment_records, default=str), order.receipt(),
+                 order.order_number, order.customer, order.created_at.isoformat(),
+                 status, idempotency_key),
             )
             if cursor.lastrowid is None:
                 raise RuntimeError("SQLite did not return an order ID.")
@@ -159,11 +200,16 @@ class SQLiteStore:
                 [(order_id, item.sku, item.name, item.quantity, str(item.unit_price))
                  for item in order.items],
             )
+            self._save_payments(order.order_number, payment_records, status, idempotency_key)
         return order_id
 
-    def complete_checkout(self, order, payments: Iterable[dict] = ()) -> None:
+    def complete_checkout(
+        self, order, payments: Iterable[dict] = (), *,
+        idempotency_key: str | None = None, status: str = "paid",
+    ) -> None:
         """Atomically decrement inventory and persist a paid order."""
         totals = order.calculate_totals()
+        payment_records = list(payments)
         with self.connection:
             for item in order.items:
                 updated = self.connection.execute(
@@ -176,10 +222,12 @@ class SQLiteStore:
             cursor = self.connection.execute(
                 "INSERT INTO orders("
                 "subtotal,tax,discount,total,payment_json,receipt,"
-                "order_number,customer,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                "order_number,customer,created_at,payment_status,idempotency_key) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (str(totals["subtotal"]), str(totals["tax"]), str(totals["discount_amount"]),
-                 str(totals["total"]), json.dumps(list(payments), default=str), order.receipt(),
-                 order.order_number, order.customer, order.created_at.isoformat()),
+                 str(totals["total"]), json.dumps(payment_records, default=str), order.receipt(),
+                 order.order_number, order.customer, order.created_at.isoformat(),
+                 status, idempotency_key),
             )
             if cursor.lastrowid is None:
                 raise RuntimeError("SQLite did not return an order ID.")
@@ -187,6 +235,71 @@ class SQLiteStore:
                 "INSERT INTO order_items VALUES (?,?,?,?,?)",
                 [(cursor.lastrowid, item.sku, item.name, item.quantity, str(item.unit_price))
                  for item in order.items],
+            )
+            self._save_payments(order.order_number, payment_records, status, idempotency_key)
+
+    def _save_payments(
+        self, order_number: str, payments: Iterable[dict], status: str,
+        idempotency_key: str | None,
+    ) -> None:
+        """Persist each tender as an individual payment record."""
+        for payment in payments:
+            self.connection.execute(
+                """INSERT INTO payments(
+                   order_number,method,amount,status,authorization_reference,idempotency_key)
+                   VALUES (?,?,?,?,?,?)""",
+                (order_number, payment["method"], str(payment["amount"]), status,
+                 payment.get("authorization_reference"), idempotency_key),
+            )
+
+    def get_order_receipt(self, order_number: str) -> str:
+        """Return the stored receipt for an order number."""
+        row = self.connection.execute(
+            "SELECT receipt FROM orders WHERE order_number = ?", (order_number,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(order_number)
+        return row["receipt"]
+
+    def get_idempotent_payment(self, idempotency_key: str) -> dict | None:
+        """Return a previously persisted checkout result for an idempotency key."""
+        order = self.connection.execute(
+            "SELECT order_number, payment_status, total, receipt "
+            "FROM orders WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        if order is None:
+            return None
+        payments = self.connection.execute(
+            """SELECT method, amount, authorization_reference
+               FROM payments WHERE idempotency_key = ? ORDER BY id""",
+            (idempotency_key,),
+        ).fetchall()
+        return {
+            "status": order["payment_status"],
+            "total": order["total"],
+            "change": "0.00",
+            "payments": [dict(payment) for payment in payments],
+            "receipt": order["receipt"],
+        }
+
+    def reverse_payment(self, payment_id: int) -> None:
+        """Mark a payment as reversed and create a refund record."""
+        with self.connection:
+            payment = self.connection.execute(
+                "SELECT order_number, amount, status FROM payments WHERE id = ?",
+                (payment_id,),
+            ).fetchone()
+            if payment is None:
+                raise KeyError(payment_id)
+            if payment["status"] in {"refunded", "reversed"}:
+                raise ValueError("Payment has already been reversed.")
+            self.connection.execute(
+                "UPDATE payments SET status = 'refunded' WHERE id = ?", (payment_id,)
+            )
+            self.connection.execute(
+                "INSERT INTO refunds(order_number, amount, payment_id) VALUES (?, ?, ?)",
+                (payment["order_number"], payment["amount"], payment_id),
             )
 
     def set_setting(self, key: str, value: str) -> None:

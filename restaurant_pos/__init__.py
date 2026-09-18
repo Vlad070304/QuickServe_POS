@@ -1,7 +1,7 @@
 """Restaurant POS package."""
 
 from .menu import Menu, MenuItem
-from .payments import Order, OrderItem, PaymentError, PaymentProcessor
+from .payments import Order, OrderItem, PaymentError, PaymentProcessor, PaymentStatus
 from .reporting import SalesReport
 from .services import CheckoutService
 from .storage import SQLiteStore
@@ -15,6 +15,7 @@ __all__ = [
     "OrderItem",
     "PaymentError",
     "PaymentProcessor",
+    "PaymentStatus",
     "SalesReport",
     "CheckoutService",
     "SQLiteStore",

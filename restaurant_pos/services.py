@@ -43,20 +43,35 @@ class CheckoutService:
         tendered_amount: float | Decimal,
         *,
         tenders: dict[str, float | Decimal] | None = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Settle an order, update inventory, and record the completed sale."""
         self._validate_stock(order)
+        store = self._shared_store()
+        if store is not None and idempotency_key:
+            previous = store.get_idempotent_payment(idempotency_key)
+            if previous is not None:
+                order.rollback()
+                return previous
         result = (
-            self.processor.process_split_payment(order, tenders)
+            self.processor.process_split_payment(
+                order, tenders, idempotency_key=idempotency_key
+            )
             if tenders is not None
-            else self.processor.process_payment(order, tendered_amount)
+            else self.processor.process_payment(
+                order, tendered_amount, idempotency_key=idempotency_key
+            )
         )
         self.sales_report.last_payment = result.get("payments", [])
         snapshot = self._copy_order(order)
-        store = self._shared_store()
         if store is not None:
             try:
-                store.complete_checkout(order, self.sales_report.last_payment)
+                store.complete_checkout(
+                    order,
+                    self.sales_report.last_payment,
+                    idempotency_key=idempotency_key,
+                    status=result["status"],
+                )
                 for item in order.items:
                     self.menu.update_stock(item.sku, -item.quantity, persist=False)
                 self.sales_report.add_order(snapshot, persist=False)
