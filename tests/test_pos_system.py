@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 from decimal import Decimal
+import time
 
 import tkinter as tk
 from hypothesis import given, strategies as st
@@ -16,6 +17,8 @@ from restaurant_pos.operations import (
     export_menu, export_sales, import_menu, import_sales, seed_demo_data,
 )
 from restaurant_pos.admin import AdminControls, StaffRole
+from restaurant_pos.operations import SalesBackupScheduler
+from restaurant_pos.storage import SQLiteStore
 
 
 @pytest.fixture(name="pos_app")
@@ -396,3 +399,145 @@ def test_staff_roles_protect_administration_controls():
 
     manager = AdminControls(menu, processor, role="manager")
     assert manager.set_tax_rate(0.05) == Decimal("0.05")
+
+
+def test_admin_controls_persist_settings_and_manage_menu(tmp_path):
+    """Persist protected administration changes and staff audit events."""
+    path = tmp_path / "admin.db"
+    store = SQLiteStore(path)
+    store.create_staff_account("admin", "secret", "admin")
+    menu = Menu(path)
+    controls = AdminControls(menu, PaymentProcessor(), store=store)
+
+    session = controls.login("admin", "secret")
+    assert session.role is StaffRole.ADMIN
+    assert controls.set_tax_rate("0.07") == Decimal("0.07")
+    assert controls.set_discount_percentage(15) == Decimal("15")
+    controls.create_menu_item(MenuItem("NEW", "New item", "Main", 3, stock=2))
+    assert controls.update_menu_item("NEW", price=4).price == 4
+    controls.adjust_stock("NEW", 1)
+    controls.apply_discount(Order(), 5)
+    controls.delete_menu_item("NEW")
+    controls.logout()
+
+    assert store.get_setting("tax_rate") == "0.07"
+    assert store.get_setting("missing", "fallback") == "fallback"
+    assert store.connection.execute("SELECT COUNT(*) FROM audit_log").fetchone()[0] >= 7
+    store.close()
+
+
+def test_admin_controls_require_authenticated_manager(tmp_path):
+    """Reject missing, mismatched, and expired persistent staff sessions."""
+    store = SQLiteStore(tmp_path / "staff.db")
+    store.create_staff_account("manager", "secret", "manager")
+    controls = AdminControls(Menu(), PaymentProcessor(), store=store)
+
+    with pytest.raises(PermissionError, match="Log in"):
+        controls.set_tax_rate(0.05)
+    session = controls.login("manager", "secret")
+    store.connection.execute("UPDATE staff_sessions SET expires_at = 0")
+    with pytest.raises(PermissionError, match="valid staff session"):
+        controls.set_tax_rate(0.05)
+    controls.session = session
+    with pytest.raises(PermissionError, match="valid staff session"):
+        controls.require_manager()
+    with pytest.raises(PermissionError):
+        store.authenticate_staff("manager", "wrong")
+    with pytest.raises(ValueError):
+        AdminControls(Menu(), PaymentProcessor(), role="unknown")
+    with pytest.raises(ValueError):
+        AdminControls.validate_discount(101)
+    store.close()
+
+
+def test_storage_payment_lifecycle_and_csv_validation(tmp_path):
+    """Exercise payment persistence, reversal, backup, and CSV validation."""
+    path = tmp_path / "lifecycle.db"
+    store = SQLiteStore(path)
+    store.save_menu_item("ITEM", "Item", "Main", 2, 3)
+    order = Order(tax_rate=0, order_number="LIFE-1")
+    order.add_item(MenuItem("ITEM", "Item", "Main", 2, stock=1))
+    payment = {"method": "cash", "amount": Decimal("2"), "authorization_reference": "a"}
+    store.save_order(order, [payment], idempotency_key="key")
+    assert store.get_order_receipt("LIFE-1").startswith("Restaurant POS")
+    assert store.get_idempotent_payment("key")["status"] == "paid"
+    payment_id = store.connection.execute("SELECT id FROM payments").fetchone()[0]
+    store.reverse_payment(payment_id)
+    with pytest.raises(ValueError, match="already"):
+        store.reverse_payment(payment_id)
+    store.set_setting("mode", "test")
+    assert store.get_setting("mode") == "test"
+    backup = tmp_path / "backup" / "copy.db"
+    store.backup_to(backup)
+    with pytest.raises(ValueError, match="differ"):
+        store.backup_to(path)
+    menu_csv = tmp_path / "menu.csv"
+    store.export_menu_csv(menu_csv)
+    assert store.import_menu_csv(menu_csv, replace=True) == 1
+    with pytest.raises(FileNotFoundError):
+        store.import_menu_csv(tmp_path / "missing.csv")
+    store.close()
+
+
+def test_reporting_search_time_windows_and_csv(tmp_path):
+    """Cover report filtering, time discounts, exports, and persistent search."""
+    report = SalesReport()
+    order = Order(tax_rate=0, order_number="REPORT-1",
+                  created_at=datetime(2026, 1, 2, 23, tzinfo=timezone.utc))
+    order.add_item(MenuItem("ITEM", "Report item", "Main", 10, stock=1))
+    report.add_order(order)
+    assert report.search("ITEM") == [order]
+    assert report.search_orders(on_date=datetime(2026, 1, 2).date()) == [order]
+    assert report.daily_totals(datetime(2026, 1, 2).date())["orders"] == Decimal("1")
+    assert report.hourly_sales() == {23: Decimal("10.00")}
+    assert report.apply_time_discount(order, 10, 22, 2)
+    assert report.best_sellers(1) == {"Report item": 1}
+    assert "Report item" in report.export_csv()
+    with pytest.raises(ValueError):
+        report.apply_time_discount(order, 10, -1, 2)
+    with pytest.raises(ValueError):
+        report.refund("REPORT-1", 100)
+
+    persisted = SalesReport(tmp_path / "report.db")
+    persisted.add_order(order)
+    assert persisted.search_history("Report")[0]["order_number"] == "REPORT-1"
+    persisted.store.close()
+
+
+def test_payment_methods_idempotency_and_partial_tenders():
+    """Handle payment method validation, idempotency, and partial settlement."""
+    item = MenuItem("ITEM", "Item", "Main", 10, stock=2)
+    order = Order(tax_rate=0)
+    order.add_item(item)
+    processor = PaymentProcessor(tax_rate=0)
+    first = processor.process_payment(order, 10, method="card", idempotency_key="same")
+    assert processor.process_payment(order, 1, idempotency_key="same") is first
+    order.rollback()
+    order.add_item(item)
+    partial = processor.process_split_payment(
+        order, {"cash": 3}, allow_partial=True, authorization_references={"cash": "ref"}
+    )
+    assert partial["status"] == "partially_paid"
+    assert partial["payments"][0]["authorization_reference"] == "ref"
+    with pytest.raises(ValueError, match="Unsupported"):
+        processor.process_payment(order, 10, method="bitcoin")
+    order.add_item(item)
+    with pytest.raises(ValueError, match="Insufficient"):
+        processor.process_split_payment(order, {"cash": 1})
+
+
+def test_backup_scheduler_creates_backup_and_rejects_duplicate_start(tmp_path):
+    """Run a scheduled backup worker and stop it cleanly."""
+    store = SQLiteStore(tmp_path / "source.db")
+    destination = tmp_path / "scheduled.db"
+    scheduler = SalesBackupScheduler(store, destination, 0.01)
+    scheduler.start()
+    with pytest.raises(RuntimeError, match="already"):
+        scheduler.start()
+    for _ in range(100):
+        if destination.exists():
+            break
+        time.sleep(0.01)
+    scheduler.stop()
+    assert destination.exists()
+    store.close()
