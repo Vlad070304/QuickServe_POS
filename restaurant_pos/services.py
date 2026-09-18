@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from pathlib import Path
+import sqlite3
 from typing import Any
 
 from .menu import Menu
@@ -49,11 +51,31 @@ class CheckoutService:
             if tenders is not None
             else self.processor.process_payment(order, tendered_amount)
         )
-        self._decrement_stock(order)
         self.sales_report.last_payment = result.get("payments", [])
-        self.sales_report.add_order(self._copy_order(order))
+        snapshot = self._copy_order(order)
+        store = self._shared_store()
+        if store is not None:
+            try:
+                store.complete_checkout(order, self.sales_report.last_payment)
+                for item in order.items:
+                    self.menu.update_stock(item.sku, -item.quantity, persist=False)
+                self.sales_report.add_order(snapshot, persist=False)
+            except (sqlite3.Error, ValueError, RuntimeError):
+                order.rollback()
+                raise
+        else:
+            self._decrement_stock(order)
+            self.sales_report.add_order(snapshot)
         order.rollback()
         return result
+
+    def _shared_store(self):
+        """Return the menu store when menu and reporting share one database."""
+        if self.menu.store is None or self.sales_report.store is None:
+            return None
+        if Path(self.menu.store.path).resolve() != Path(self.sales_report.store.path).resolve():
+            return None
+        return self.menu.store
 
     def _validate_stock(self, order: Order) -> None:
         """Ensure all order quantities can be fulfilled before payment."""

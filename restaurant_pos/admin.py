@@ -6,6 +6,7 @@ from enum import Enum
 
 from .menu import Menu, MenuItem
 from .payments import PaymentProcessor
+from .storage import SQLiteStore
 
 
 class StaffRole(str, Enum):
@@ -24,10 +25,21 @@ class AdminControls:
         menu: Menu,
         processor: PaymentProcessor,
         role: StaffRole | str = StaffRole.ADMIN,
+        store: SQLiteStore | None = None,
     ) -> None:
         """Create administrator controls for the supplied menu and processor."""
         self.menu = menu
         self.processor = processor
+        self.store = store
+        if self.store:
+            saved_rate = self.store.get_setting("tax_rate")
+            if saved_rate is not None:
+                self.processor.tax_rate = Decimal(saved_rate)
+        saved_discount = (
+            self.store.get_setting("discount_percentage")
+            if self.store else None
+        )
+        self.discount_percentage = Decimal(saved_discount or "10")
         try:
             self.role = StaffRole(role)
         except ValueError as exc:
@@ -44,7 +56,18 @@ class AdminControls:
         if Decimal(str(rate)) < 0:
             raise ValueError("Tax rate cannot be negative.")
         self.processor.tax_rate = Decimal(str(rate)).quantize(Decimal("0.01"))
+        if self.store:
+            self.store.set_setting("tax_rate", str(self.processor.tax_rate))
         return self.processor.tax_rate
+
+    def set_discount_percentage(self, percentage: float | Decimal) -> Decimal:
+        """Set and persist the default order discount percentage."""
+        self.require_manager()
+        value = self.validate_discount(percentage)
+        self.discount_percentage = value
+        if self.store:
+            self.store.set_setting("discount_percentage", str(value))
+        return value
 
     def create_menu_item(self, item: MenuItem) -> None:
         """Add a menu item through the administrator interface."""

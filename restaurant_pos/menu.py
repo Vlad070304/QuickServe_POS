@@ -58,7 +58,7 @@ class Menu:
         """Return menu items sorted alphabetically by name."""
         return sorted(self._items.values(), key=lambda item: item.name)
 
-    def update_stock(self, sku: str, quantity: int) -> None:
+    def update_stock(self, sku: str, quantity: int, *, persist: bool = True) -> None:
         """Adjust stock for a menu item by the requested quantity."""
         item = self.get_item(sku)
         new_stock = item.stock + quantity
@@ -71,7 +71,7 @@ class Menu:
             price=item.price,
             stock=new_stock,
         )
-        if self.store:
+        if self.store and persist:
             updated = self._items[sku]
             self.store.save_menu_item(updated.sku, updated.name, updated.category,
                                       updated.price, updated.stock)

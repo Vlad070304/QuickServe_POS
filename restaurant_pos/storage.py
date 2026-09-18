@@ -16,31 +16,87 @@ class SQLiteStore:
         self.path = str(path)
         self.connection = sqlite3.connect(self.path)
         self.connection.row_factory = sqlite3.Row
+        self.connection.execute("PRAGMA foreign_keys = ON")
+        self.connection.execute("PRAGMA busy_timeout = 5000")
         self.connection.executescript(
             """
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+              version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
             CREATE TABLE IF NOT EXISTS menu_items (
               sku TEXT PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL,
               price REAL NOT NULL, stock INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS orders (
               id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-              order_number TEXT, customer TEXT,
+              order_number TEXT UNIQUE, customer TEXT,
               subtotal TEXT NOT NULL, tax TEXT NOT NULL, discount TEXT NOT NULL,
               total TEXT NOT NULL, payment_json TEXT NOT NULL, receipt TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS order_items (
-              order_id INTEGER NOT NULL REFERENCES orders(id),
+              order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
               sku TEXT NOT NULL, name TEXT NOT NULL, quantity INTEGER NOT NULL,
               unit_price TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS refunds (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              order_number TEXT NOT NULL REFERENCES orders(order_number),
+              amount TEXT NOT NULL,
+              created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS settings (
+              key TEXT PRIMARY KEY, value TEXT NOT NULL
+            );
             """
         )
-        for column, definition in (("order_number", "TEXT"), ("customer", "TEXT")):
-            try:
-                self.connection.execute(f"ALTER TABLE orders ADD COLUMN {column} {definition}")
-            except sqlite3.OperationalError:
-                pass
+        self._run_migrations()
         self.connection.commit()
+
+    def _run_migrations(self) -> None:
+        """Apply schema changes in order so upgrades are explicit and repeatable."""
+        applied = {
+            row["version"]
+            for row in self.connection.execute("SELECT version FROM schema_migrations")
+        }
+        if 1 not in applied:
+            columns = {
+                row["name"]
+                for row in self.connection.execute("PRAGMA table_info(orders)")
+            }
+            for column in ("order_number", "customer"):
+                if column not in columns:
+                    self.connection.execute(f"ALTER TABLE orders ADD COLUMN {column} TEXT")
+            duplicates = self.connection.execute(
+                """SELECT order_number FROM orders
+                   WHERE order_number IS NOT NULL
+                   GROUP BY order_number HAVING COUNT(*) > 1"""
+            ).fetchall()
+            for duplicate in duplicates:
+                rows = self.connection.execute(
+                    "SELECT id FROM orders WHERE order_number = ? ORDER BY id",
+                    (duplicate["order_number"],),
+                ).fetchall()
+                for row in rows[1:]:
+                    self.connection.execute(
+                        "UPDATE orders SET order_number = ? WHERE id = ?",
+                        (f"{duplicate['order_number']}-{row['id']}", row["id"]),
+                    )
+            self.connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_orders_order_number "
+                "ON orders(order_number)"
+            )
+            self.connection.execute(
+                "CREATE INDEX IF NOT EXISTS ix_orders_created_at ON orders(created_at)"
+            )
+            self.connection.execute(
+                "CREATE INDEX IF NOT EXISTS ix_orders_customer ON orders(customer)"
+            )
+            self.connection.execute(
+                "CREATE INDEX IF NOT EXISTS ix_order_items_sku ON order_items(sku)"
+            )
+            self.connection.execute(
+                "INSERT INTO schema_migrations(version) VALUES (1)"
+            )
 
     def save_menu_item(self, sku: str, name: str, category: str, price: float, stock: int) -> None:
         """Insert or replace one menu item."""
@@ -67,24 +123,76 @@ class SQLiteStore:
     def save_order(self, order, payments: Iterable[dict] = ()) -> int:
         """Persist an order and its line items, returning the database ID."""
         totals = order.calculate_totals()
-        cursor = self.connection.execute(
-            "INSERT INTO orders("
-            "subtotal,tax,discount,total,payment_json,receipt,"
-            "order_number,customer,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
-            (str(totals["subtotal"]), str(totals["tax"]), str(totals["discount_amount"]),
-             str(totals["total"]), json.dumps(list(payments), default=str), order.receipt(),
-             order.order_number, order.customer, order.created_at.isoformat()),
-        )
-        if cursor.lastrowid is None:
-            raise RuntimeError("SQLite did not return an order ID.")
-        order_id = cursor.lastrowid
-        self.connection.executemany(
-            "INSERT INTO order_items VALUES (?,?,?,?,?)",
-            [(order_id, item.sku, item.name, item.quantity, str(item.unit_price))
-             for item in order.items],
-        )
-        self.connection.commit()
+        with self.connection:
+            cursor = self.connection.execute(
+                "INSERT INTO orders("
+                "subtotal,tax,discount,total,payment_json,receipt,"
+                "order_number,customer,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (str(totals["subtotal"]), str(totals["tax"]), str(totals["discount_amount"]),
+                 str(totals["total"]), json.dumps(list(payments), default=str), order.receipt(),
+                 order.order_number, order.customer, order.created_at.isoformat()),
+            )
+            if cursor.lastrowid is None:
+                raise RuntimeError("SQLite did not return an order ID.")
+            order_id = cursor.lastrowid
+            self.connection.executemany(
+                "INSERT INTO order_items VALUES (?,?,?,?,?)",
+                [(order_id, item.sku, item.name, item.quantity, str(item.unit_price))
+                 for item in order.items],
+            )
         return order_id
+
+    def complete_checkout(self, order, payments: Iterable[dict] = ()) -> None:
+        """Atomically decrement inventory and persist a paid order."""
+        totals = order.calculate_totals()
+        with self.connection:
+            for item in order.items:
+                updated = self.connection.execute(
+                    "UPDATE menu_items SET stock = stock - ? "
+                    "WHERE sku = ? AND stock >= ?",
+                    (item.quantity, item.sku, item.quantity),
+                )
+                if updated.rowcount != 1:
+                    raise ValueError(f"Not enough stock for menu item: {item.sku}")
+            cursor = self.connection.execute(
+                "INSERT INTO orders("
+                "subtotal,tax,discount,total,payment_json,receipt,"
+                "order_number,customer,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                (str(totals["subtotal"]), str(totals["tax"]), str(totals["discount_amount"]),
+                 str(totals["total"]), json.dumps(list(payments), default=str), order.receipt(),
+                 order.order_number, order.customer, order.created_at.isoformat()),
+            )
+            if cursor.lastrowid is None:
+                raise RuntimeError("SQLite did not return an order ID.")
+            self.connection.executemany(
+                "INSERT INTO order_items VALUES (?,?,?,?,?)",
+                [(cursor.lastrowid, item.sku, item.name, item.quantity, str(item.unit_price))
+                 for item in order.items],
+            )
+
+    def set_setting(self, key: str, value: str) -> None:
+        """Persist an application setting."""
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO settings(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, value),
+            )
+
+    def get_setting(self, key: str, default: str | None = None) -> str | None:
+        """Return a persisted setting or its supplied default."""
+        row = self.connection.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)
+        ).fetchone()
+        return row["value"] if row else default
+
+    def save_refund(self, order_number: str, amount) -> None:
+        """Persist a refund against an existing order."""
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO refunds(order_number, amount) VALUES (?, ?)",
+                (order_number, str(amount)),
+            )
 
     def search_orders(self, query: str = "", on_date: str | None = None) -> list[sqlite3.Row]:
         """Search persisted orders by text and optional calendar date."""

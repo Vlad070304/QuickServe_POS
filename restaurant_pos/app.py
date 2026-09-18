@@ -69,7 +69,10 @@ class RestaurantPOSApp(tk.Tk):
             self.processor,
             self.sales_report,
         )
-        self.admin = AdminControls(self.menu, self.processor, role=staff_role)
+        self.admin = AdminControls(
+            self.menu, self.processor, role=staff_role,
+            store=self.sales_report.store,
+        )
         self.order_panel: tk.Frame
         self.order_listbox: tk.Listbox
         self.summary_frame: tk.Frame
@@ -327,7 +330,7 @@ class RestaurantPOSApp(tk.Tk):
     def apply_discount(self) -> None:
         """Apply the standard ten-percent order discount."""
         try:
-            self.order.apply_discount(10)
+            self.order.apply_discount(self.admin.discount_percentage)
             self.status_var.set("10% discount applied to the order.")
             self.refresh_order_panel()
         except ValueError as exc:
