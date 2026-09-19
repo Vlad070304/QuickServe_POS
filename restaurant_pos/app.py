@@ -1,30 +1,41 @@
-"""Tkinter-based restaurant POS application."""
+"""Tkinter-based restaurant POS application.
+
+This module is the application controller: it owns the domain objects
+(menu, order, payment processor, sales report, admin controls) and wires
+them to the view components in :mod:`restaurant_pos.ui`. The view
+components handle their own widget layout and styling; this file only
+coordinates user actions, validation errors, and status updates between
+them.
+"""
 
 from __future__ import annotations
 
-import tkinter as tk
 import os
-from tkinter import filedialog, messagebox, simpledialog, ttk
+import tkinter as tk
+from tkinter import messagebox, simpledialog, ttk  # noqa: F401  (see note below)  # pylint: disable=unused-import
 from decimal import Decimal
 from pathlib import Path
 
-from .menu import MenuItem, build_demo_menu
+from .menu import Menu, MenuItem, build_demo_menu
 from .payments import Order, PaymentError, PaymentProcessor
 from .reporting import SalesReport
 from .services import CheckoutService
 from .admin import AdminControls, StaffRole
 from .operations import SalesBackupScheduler
+from .ui.settings import AppSettings
+from .ui.theme import apply_theme
+from .ui.dialogs import DialogService
+from .ui.menu_panel import MenuPanel
+from .ui.order_panel import OrderPanel
+from .ui.admin_panel import AdminPanel
+from .ui.status_bar import StatusBar
+from .ui.history_window import OrderHistoryWindow
 
-COLORS = {
-    "background": "#f4f7fb",
-    "surface": "#ffffff",
-    "primary": "#cfe8ff",
-    "primary_text": "#143050",
-    "text": "#183153",
-    "muted": "#314f74",
-    "success": "#d9f7e8",
-    "danger": "#fbe8e8",
-}
+# `messagebox`, `simpledialog`, and `ttk` are imported here (and not just in
+# restaurant_pos.ui.dialogs) so that patching restaurant_pos.app.messagebox.*
+# in tests still reaches the same shared tkinter.messagebox module object
+# that DialogService calls into, and so ttk remains available for any
+# direct styling callers of this module.
 
 
 class RestaurantPOSApp(tk.Tk):
@@ -34,89 +45,71 @@ class RestaurantPOSApp(tk.Tk):
         self,
         db_path: str | Path | None = None,
         staff_role: StaffRole | str = StaffRole.ADMIN,
+        settings: AppSettings | None = None,
     ) -> None:
-        """Initialize the application state and widgets."""
+        """Initialize application state, domain services, and the UI."""
         super().__init__()
-        self.title("QuickServe POS")
-        self.geometry("980x620")
-        self.configure(bg=COLORS["background"])
-        self._configure_theme()
+        self.settings = settings or AppSettings()
+        self.title(self.settings.title)
+        self.geometry(self.settings.geometry)
+        apply_theme(self, self.settings)
+        self.dialogs = DialogService()
 
-        self.menu = build_demo_menu() if db_path is None else __import__(
-            "restaurant_pos.menu", fromlist=["Menu"]).Menu(db_path)
-        if db_path is not None and not self.menu.list_items():
-            for item in build_demo_menu().list_items():
-                self.menu.add_item(item)
-        self.order = Order()
-        self.processor = PaymentProcessor(tax_rate=0.08)
-        self.sales_report = SalesReport(db_path)
-        self.backup_scheduler = None
-        backup_path = os.getenv("QUICKSERVE_BACKUP_PATH")
-        if db_path is not None and backup_path:
-            if self.sales_report.store is None:
-                raise RuntimeError("Persistent sales storage is required for backups.")
-            interval = float(os.getenv("QUICKSERVE_BACKUP_INTERVAL", "300"))
-            if interval <= 0:
-                raise ValueError("QUICKSERVE_BACKUP_INTERVAL must be greater than zero.")
-            self.backup_scheduler = SalesBackupScheduler(
-                self.sales_report.store, backup_path,
-                interval,
-                on_error=lambda exc: self.status_var.set(f"Backup error: {exc}"),
-            )
-            self.backup_scheduler.start()
-        self.checkout_service = CheckoutService(
-            self.menu,
-            self.processor,
-            self.sales_report,
-        )
-        self.admin = AdminControls(
-            self.menu, self.processor, role=staff_role,
-            store=self.sales_report.store,
-        )
-        self.order_panel: tk.Frame
-        self.order_listbox: tk.Listbox
-        self.summary_frame: tk.Frame
-        self.subtotal_var: tk.StringVar
-        self.tax_var: tk.StringVar
-        self.total_var: tk.StringVar
-        self.controls: tk.Frame
-        self.payment_entry: tk.Entry
-        self.discount_button: tk.Button
-        self.clear_button: tk.Button
-        self.checkout_button: tk.Button
-        self.customer_entry: tk.Entry
-        self.split_cash_entry: tk.Entry
-        self.split_card_entry: tk.Entry
-        self.tax_button: tk.Button
-        self.add_item_button: tk.Button
-        self.remove_item_button: tk.Button
-        self.status_var: tk.StringVar
-        self.order_summary_var: tk.StringVar
-        self.sales_var: tk.StringVar
-        self.role_var: tk.StringVar
-        self.order_summary_var = tk.StringVar(value="Cart is empty")
-        self.role_var = tk.StringVar(value=f"Role: {self.admin.role.value.title()}")
+        self._init_domain(db_path, staff_role)
 
         self.build_ui()
         self._bind_shortcuts()
         self.refresh_order_panel()
 
-    def _configure_theme(self) -> None:
-        """Configure the standard ttk theme and shared application colors."""
-        style = ttk.Style(self)
-        if "clam" in style.theme_names():
-            style.theme_use("clam")
-        style.configure(
-            "POS.TLabel",
-            background=COLORS["background"],
-            foreground=COLORS["muted"],
-        )
+    # ------------------------------------------------------------------
+    # Domain / service wiring
+    # ------------------------------------------------------------------
+    def _init_domain(
+        self, db_path: str | Path | None, staff_role: StaffRole | str,
+    ) -> None:
+        """Create the menu, order, payment, reporting, and admin services."""
+        self.menu = build_demo_menu() if db_path is None else Menu(db_path)
+        if db_path is not None and not self.menu.list_items():
+            for item in build_demo_menu().list_items():
+                self.menu.add_item(item)
 
-    def _bind_shortcuts(self) -> None:
-        """Register keyboard shortcuts for frequent point-of-sale actions."""
-        self.bind_all("<Control-Return>", lambda _event: self.checkout())
-        self.bind_all("<Escape>", lambda _event: self.clear_order())
-        self.bind_all("<Control-d>", lambda _event: self.apply_discount())
+        self.order = Order()
+        self.processor = PaymentProcessor(tax_rate=self.settings.default_tax_rate)
+        self.sales_report = SalesReport(db_path)
+        self.backup_scheduler = self._build_backup_scheduler(db_path)
+        self.checkout_service = CheckoutService(
+            self.menu, self.processor, self.sales_report)
+        self.admin = AdminControls(
+            self.menu, self.processor, role=staff_role, store=self.sales_report.store)
+
+    def _build_backup_scheduler(
+        self, db_path: str | Path | None,
+    ) -> SalesBackupScheduler | None:
+        """Start a background backup scheduler when configured via env vars."""
+        backup_path = os.getenv("QUICKSERVE_BACKUP_PATH")
+        if db_path is None or not backup_path:
+            return None
+        if self.sales_report.store is None:
+            raise RuntimeError("Persistent sales storage is required for backups.")
+        interval = float(os.getenv(
+            "QUICKSERVE_BACKUP_INTERVAL", str(self.settings.default_backup_interval_seconds)))
+        if interval <= 0:
+            raise ValueError("QUICKSERVE_BACKUP_INTERVAL must be greater than zero.")
+        scheduler = SalesBackupScheduler(
+            self.sales_report.store, backup_path, interval,
+            on_error=self._on_backup_error,
+        )
+        scheduler.start()
+        return scheduler
+
+    def _on_backup_error(self, exc: Exception) -> None:
+        """Report a backup failure from the scheduler's background thread.
+
+        This runs on the scheduler's worker thread, so it must not touch
+        Tkinter state directly; ``StatusBar.report_error_threadsafe``
+        marshals the update onto the main thread via ``after``.
+        """
+        self.status_bar.report_error_threadsafe(f"Backup error: {exc}")
 
     def destroy(self) -> None:
         """Stop background work before closing the Tk application."""
@@ -128,246 +121,112 @@ class RestaurantPOSApp(tk.Tk):
             self.sales_report.store.close()
         super().destroy()
 
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+    def _bind_shortcuts(self) -> None:
+        """Register keyboard shortcuts for frequent point-of-sale actions."""
+        self.bind_all("<Control-Return>", lambda _event: self.checkout())
+        self.bind_all("<Escape>", lambda _event: self.clear_order())
+        self.bind_all("<Control-d>", lambda _event: self.apply_discount())
+
     def build_ui(self) -> None:
-        """Construct the menu, order, payment, and status controls."""
-        self.root_frame = tk.Frame(self, padx=18, pady=18, bg=COLORS["background"])
+        """Construct the menu, order, admin, and status view components."""
+        self.root_frame = ttk.Frame(self, padding=18, style="Background.TFrame")
         self.root_frame.pack(fill=tk.BOTH, expand=True)
 
-        self.menu_panel = tk.Frame(self.root_frame, bg=COLORS["surface"], bd=1, relief=tk.SOLID)
+        self.menu_panel = MenuPanel(
+            self.root_frame, self.settings, on_select=self.add_item_to_order)
         self.menu_panel.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 16))
+        # Exposed for backward-compatible/test access; MenuPanel mutates
+        # this same list in place on every refresh rather than replacing it.
+        self.menu_buttons = self.menu_panel.buttons
 
-        tk.Label(
-            self.menu_panel,
-            text="Menu",
-            font=("Segoe UI", 18, "bold"),
-            bg=COLORS["surface"],
-        ).pack(pady=(12, 6))
+        self.order_panel = OrderPanel(
+            self.root_frame, self.settings,
+            on_checkout=self.checkout,
+            on_split_checkout=self.split_checkout,
+            on_clear=self.clear_order,
+            on_discount=self.apply_discount,
+            on_export_csv=self.export_report,
+            on_export_receipts=self.export_receipts,
+        )
+        self.order_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.payment_entry = self.order_panel.payment_entry
+        self.customer_entry = self.order_panel.customer_entry
+        self.split_cash_entry = self.order_panel.split_cash_entry
+        self.split_card_entry = self.order_panel.split_card_entry
+        self.checkout_button = self.order_panel.checkout_button
+        self.discount_button = self.order_panel.discount_button
+        self.clear_button = self.order_panel.clear_button
 
-        self.menu_buttons: list[tk.Button] = []
+        self.admin_panel = AdminPanel(
+            self.order_panel.controls, self.admin.role,
+            on_set_tax=self.set_tax,
+            on_add_item=self.add_menu_item,
+            on_remove_item=self.remove_menu_item,
+            on_view_history=self.view_order_history,
+        )
+        self.admin_panel.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.tax_button = self.admin_panel.tax_button
+        self.add_item_button = self.admin_panel.add_item_button
+        self.remove_item_button = self.admin_panel.remove_item_button
+        self.role_var = self.admin_panel.role_var
+
+        self.status_bar = StatusBar(self.root_frame, self.settings)
+        self.status_bar.pack(side=tk.BOTTOM, fill=tk.X)
+        self.status_var = self.status_bar.status_var
+        self.order_summary_var = self.status_bar.order_summary_var
+        self.sales_var = self.status_bar.sales_var
+
         self.refresh_menu_panel()
 
     def refresh_menu_panel(self) -> None:
         """Refresh menu buttons after administrator inventory changes."""
-        for button in self.menu_buttons:
-            button.destroy()
-        self.menu_buttons.clear()
-        for item in self.menu.list_items():
-            def add_selected_item(sku: str = item.sku) -> None:
-                """Add the selected menu item to the current order."""
-                self.add_item_to_order(sku)
+        self.menu_panel.refresh(self.menu.list_items())
 
-            button = tk.Button(
-                self.menu_panel,
-                text=f"{item.name} - ${item.price:.2f}",
-                width=22,
-                height=2,
-                command=add_selected_item,
-                bg=COLORS["primary"],
-                fg=COLORS["text"],
-                font=("Segoe UI", 10, "bold"),
-            )
-            button.pack(pady=4, padx=12, fill=tk.X)
-            self.menu_buttons.append(button)
+    def refresh_order_panel(self) -> None:
+        """Refresh displayed items, totals, and sales information."""
+        totals = self.processor.calculate_order_total(self.order)
+        summary = self.order_panel.refresh(self.order, totals)
+        self.status_bar.order_summary_var.set(summary)
+        self.status_bar.sales_var.set(
+            f"Today's sales: ${self.sales_report.total_revenue():.2f}")
 
-        self.order_panel = tk.Frame(self.root_frame, bg=COLORS["surface"], bd=1, relief=tk.SOLID)
-        self.order_panel.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        tk.Label(
-            self.order_panel,
-            text="Current Order",
-            font=("Segoe UI", 18, "bold"),
-            bg=COLORS["surface"],
-        ).pack(pady=(12, 8))
-        self.order_listbox = tk.Listbox(
-            self.order_panel,
-            width=48,
-            height=14,
-            font=("Segoe UI", 11),
-        )
-        self.order_listbox.pack(padx=12, fill=tk.BOTH, expand=True)
-
-        self.summary_frame = tk.Frame(self.order_panel, bg=COLORS["surface"])
-        self.summary_frame.pack(fill=tk.X, padx=12, pady=10)
-
-        self.subtotal_var = tk.StringVar(value="Subtotal: $0.00")
-        self.tax_var = tk.StringVar(value="Tax: $0.00")
-        self.total_var = tk.StringVar(value="Total: $0.00")
-
-        tk.Label(
-            self.summary_frame,
-            textvariable=self.subtotal_var,
-            bg=COLORS["surface"],
-            font=("Segoe UI", 11),
-        ).pack(anchor="w")
-        tk.Label(
-            self.summary_frame,
-            textvariable=self.tax_var,
-            bg=COLORS["surface"],
-            font=("Segoe UI", 11),
-        ).pack(anchor="w")
-        tk.Label(
-            self.summary_frame,
-            textvariable=self.total_var,
-            bg=COLORS["surface"],
-            font=("Segoe UI", 11, "bold"),
-        ).pack(anchor="w")
-
-        self.controls = tk.Frame(self.order_panel, bg=COLORS["surface"])
-        self.controls.pack(fill=tk.X, padx=12, pady=(8, 12))
-
-        tk.Label(
-            self.controls,
-            text="Cash tendered",
-            bg=COLORS["surface"],
-            font=("Segoe UI", 10),
-        ).grid(row=0, column=0, padx=(0, 8), sticky="w")
-        self.payment_entry = tk.Entry(self.controls, width=18, font=("Segoe UI", 11))
-        self.payment_entry.grid(row=0, column=1, sticky="ew")
-        self.payment_entry.insert(0, "0.00")
-
-        self.discount_button = tk.Button(
-            self.controls,
-            text="Apply 10% Discount",
-            command=self.apply_discount,
-            bg=COLORS["success"],
-            fg="#113b2d",
-        )
-        self.discount_button.grid(row=1, column=0, pady=(10, 0), sticky="ew")
-
-        self.clear_button = tk.Button(
-            self.controls,
-            text="Clear Order",
-            command=self.clear_order,
-            bg=COLORS["danger"],
-            fg="#5d2323",
-        )
-        self.clear_button.grid(row=1, column=1, pady=(10, 0), sticky="ew")
-
-        self.checkout_button = tk.Button(
-            self.controls,
-            text="Checkout",
-            command=self.checkout,
-            bg=COLORS["primary"],
-            fg=COLORS["primary_text"],
-            font=("Segoe UI", 10, "bold"),
-        )
-        self.checkout_button.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
-        self.customer_entry = tk.Entry(self.controls, width=18)
-        self.customer_entry.insert(0, "")
-        self.customer_entry.grid(row=3, column=0, columnspan=2, pady=(8, 0), sticky="ew")
-        self.split_cash_entry = tk.Entry(self.controls, width=8)
-        self.split_card_entry = tk.Entry(self.controls, width=8)
-        self.split_cash_entry.insert(0, "0")
-        self.split_card_entry.insert(0, "0")
-        self.split_cash_entry.grid(row=4, column=0, sticky="ew")
-        self.split_card_entry.grid(row=4, column=1, sticky="ew")
-        tk.Button(self.controls, text="Split Cash + Card", command=self.split_checkout).grid(
-            row=5, column=0, columnspan=2, sticky="ew")
-        tk.Button(self.controls, text="Export CSV", command=self.export_report).grid(
-            row=6, column=0, sticky="ew")
-        tk.Button(
-            self.controls,
-            text="Receipt PDF / Kitchen Ticket",
-            command=self.export_receipts,
-        ).grid(row=6, column=1, sticky="ew")
-        self.tax_button = tk.Button(self.controls, text="Admin: Set Tax", command=self.set_tax)
-        self.tax_button.grid(
-            row=7, column=0, columnspan=2, sticky="ew")
-        self.add_item_button = tk.Button(
-            self.controls, text="Admin: Add Item", command=self.add_menu_item)
-        self.add_item_button.grid(
-            row=8, column=0, sticky="ew")
-        self.remove_item_button = tk.Button(
-            self.controls, text="Admin: Remove Item", command=self.remove_menu_item)
-        self.remove_item_button.grid(
-            row=8, column=1, sticky="ew")
-        ttk.Label(
-            self.controls,
-            textvariable=self.role_var,
-            style="POS.TLabel",
-        ).grid(row=9, column=0, columnspan=2, sticky="w")
-        if self.admin.role == StaffRole.CASHIER:
-            for button in (self.tax_button, self.add_item_button, self.remove_item_button):
-                button.configure(state=tk.DISABLED)
-
-        self.status_var = tk.StringVar(value="Ready for service.")
-        self.sales_var = tk.StringVar(value="Today's sales: $0.00")
-        ttk.Label(
-            self.root_frame,
-            textvariable=self.order_summary_var,
-            style="POS.TLabel",
-            anchor="w",
-        ).pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
-        tk.Label(
-            self.root_frame,
-            textvariable=self.sales_var,
-            bg=COLORS["background"],
-            fg=COLORS["muted"],
-            anchor="w",
-            justify="left",
-            wraplength=260,
-        ).pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 0))
-        tk.Label(
-            self.root_frame,
-            textvariable=self.status_var,
-            bg=COLORS["background"],
-            fg=COLORS["muted"],
-            anchor="w",
-            justify="left",
-            wraplength=260,
-        ).pack(side=tk.BOTTOM, fill=tk.X, pady=(4, 0))
-
+    # ------------------------------------------------------------------
+    # Cashier actions
+    # ------------------------------------------------------------------
     def add_item_to_order(self, sku: str) -> None:
         """Add a selected menu item to the active order."""
         try:
             menu_item = self.menu.get_item(sku)
             self.checkout_service.add_item(self.order, sku)
-            self.status_var.set(f"Added {menu_item.name} to the order.")
+            self.status_bar.set_status(f"Added {menu_item.name} to the order.")
             self.refresh_order_panel()
         except ValueError as exc:
-            messagebox.showerror("Order Error", str(exc))
+            self.dialogs.error("Order Error", str(exc))
 
     def apply_discount(self) -> None:
-        """Apply the standard ten-percent order discount."""
+        """Apply the configured default order discount."""
         try:
             self.admin.apply_discount(self.order, self.admin.discount_percentage)
-            self.status_var.set("10% discount applied to the order.")
+            self.status_bar.set_status(
+                f"{self.admin.discount_percentage}% discount applied to the order.")
             self.refresh_order_panel()
         except ValueError as exc:
-            messagebox.showerror("Discount Error", str(exc))
+            self.dialogs.error("Discount Error", str(exc))
 
     def clear_order(self) -> None:
         """Discard the active order and refresh the display."""
         self.order.rollback()
-        self.status_var.set("Order cleared.")
+        self.status_bar.set_status("Order cleared.")
         self.refresh_order_panel()
-
-    def refresh_order_panel(self) -> None:
-        """Refresh displayed items, totals, and sales information."""
-        self.order_listbox.delete(0, tk.END)
-        if not self.order.items:
-            self.order_listbox.insert(tk.END, "No items in the order.")
-            self.checkout_button.configure(state=tk.DISABLED)
-            self.order_summary_var.set("Cart is empty - add an item to begin")
-        else:
-            self.checkout_button.configure(state=tk.NORMAL)
-            for item in self.order.items:
-                line = f"{item.name} x{item.quantity} - ${item.line_total():.2f}"
-                self.order_listbox.insert(tk.END, line)
-            item_count = sum(item.quantity for item in self.order.items)
-            self.order_summary_var.set(f"{item_count} item(s) in cart")
-
-        totals = self.processor.calculate_order_total(self.order)
-        self.subtotal_var.set(f"Subtotal: ${totals['subtotal']:.2f}")
-        self.tax_var.set(f"Tax: ${totals['tax']:.2f}")
-        self.total_var.set(f"Total: ${totals['total']:.2f}")
-        self.sales_var.set(f"Today's sales: ${self.sales_report.total_revenue():.2f}")
 
     def checkout(self) -> None:
         """Process the entered payment and display the resulting receipt."""
         try:
-            self.order.customer = self.customer_entry.get().strip()
-            amount_text = self.payment_entry.get().strip()
+            self.order.customer = self.order_panel.customer_entry.get().strip()
+            amount_text = self.order_panel.payment_entry.get().strip()
             if not amount_text:
                 raise ValueError("Enter a cash amount before checking out.")
             try:
@@ -377,81 +236,104 @@ class RestaurantPOSApp(tk.Tk):
             payment_result = self.checkout_service.checkout(self.order, amount)
             receipt_text = payment_result["receipt"]
 
-            self.status_var.set(
+            self.status_bar.set_status(
                 "Payment successful. Receipt generated. "
                 f"Total: ${payment_result['total']:.2f}"
             )
             self.refresh_order_panel()
-            messagebox.showinfo("Receipt", receipt_text)
+            self.refresh_menu_panel()
+            self.dialogs.info("Receipt", receipt_text)
         except (ValueError, PaymentError) as exc:
-            self.status_var.set(str(exc))
-            messagebox.showerror("Payment Error", str(exc))
-
-    def set_tax(self) -> None:
-        """Prompt for and apply a new tax rate."""
-        value = simpledialog.askfloat("Admin Tax", "Tax rate (e.g. 0.08):",
-                                      initialvalue=float(self.processor.tax_rate))
-        if value is not None:
-            self.admin.set_tax_rate(value)
-            self.refresh_order_panel()
-
-    def add_menu_item(self) -> None:
-        """Collect and add a menu item through the administrator controls."""
-        sku = simpledialog.askstring("Admin Menu", "SKU:")
-        name = simpledialog.askstring("Admin Menu", "Name:")
-        category = simpledialog.askstring("Admin Menu", "Category:")
-        price = simpledialog.askfloat("Admin Menu", "Price:", minvalue=0)
-        stock = simpledialog.askinteger("Admin Menu", "Opening stock:", minvalue=0)
-        if sku is None or name is None or category is None or price is None or stock is None:
-            return
-        try:
-            self.admin.create_menu_item(MenuItem(sku, name, category, price, stock))
-            self.refresh_menu_panel()
-            self.status_var.set(f"Added {name} to the menu.")
-        except ValueError as exc:
-            messagebox.showerror("Menu Error", str(exc))
-
-    def remove_menu_item(self) -> None:
-        """Remove a menu item by SKU through the administrator controls."""
-        sku = simpledialog.askstring("Admin Menu", "SKU to remove:")
-        if not sku:
-            return
-        try:
-            self.admin.delete_menu_item(sku)
-            self.refresh_menu_panel()
-            self.status_var.set(f"Removed {sku} from the menu.")
-        except (KeyError, ValueError) as exc:
-            messagebox.showerror("Menu Error", str(exc))
+            self.status_bar.set_status(str(exc))
+            self.dialogs.error("Payment Error", str(exc))
 
     def split_checkout(self) -> None:
         """Checkout using cash and card partial tenders."""
         try:
             tenders: dict[str, float | Decimal] = {
-                "cash": float(self.split_cash_entry.get() or 0),
-                "card": float(self.split_card_entry.get() or 0),
+                "cash": float(self.order_panel.split_cash_entry.get() or 0),
+                "card": float(self.order_panel.split_card_entry.get() or 0),
             }
-            result = self.checkout_service.checkout(
-                self.order, 0, tenders=tenders)
-            messagebox.showinfo("Receipt", result["receipt"])
+            result = self.checkout_service.checkout(self.order, 0, tenders=tenders)
+            self.dialogs.info("Receipt", result["receipt"])
             self.refresh_order_panel()
+            self.refresh_menu_panel()
         except (ValueError, PaymentError) as exc:
-            messagebox.showerror("Payment Error", str(exc))
+            self.dialogs.error("Payment Error", str(exc))
 
     def export_report(self) -> None:
         """Prompt for a destination and export sales data as CSV."""
-        path = filedialog.asksaveasfilename(defaultextension=".csv")
+        path = self.dialogs.ask_save_path(".csv")
         if path:
             self.sales_report.export_csv(path)
 
     def export_receipts(self) -> None:
         """Save the active receipt as PDF and display its kitchen ticket."""
         if not self.order.items:
-            messagebox.showinfo("Receipt", "Complete an order first.")
+            self.dialogs.info("Receipt", "Complete an order first.")
             return
-        path = filedialog.asksaveasfilename(defaultextension=".pdf")
+        path = self.dialogs.ask_save_path(".pdf")
         if path:
             self.order.save_pdf(path)
-        messagebox.showinfo("Kitchen Ticket", self.order.kitchen_ticket())
+        self.dialogs.info("Kitchen Ticket", self.order.kitchen_ticket())
+
+    def view_order_history(self) -> None:
+        """Open the order history screen for browsing and searching sales."""
+        OrderHistoryWindow(self, self.sales_report)
+
+    # ------------------------------------------------------------------
+    # Administrator actions
+    # ------------------------------------------------------------------
+    def set_tax(self) -> None:
+        """Prompt for and apply a new tax rate."""
+        value = self.dialogs.ask_float(
+            "Admin Tax", "Tax rate (e.g. 0.08):",
+            initialvalue=float(self.processor.tax_rate))
+        if value is not None:
+            try:
+                self.admin.set_tax_rate(value)
+                self.refresh_order_panel()
+                self.status_bar.set_status(f"Tax rate set to {value}.")
+            except (PermissionError, ValueError) as exc:
+                self.dialogs.error("Admin Error", str(exc))
+
+    def add_menu_item(self) -> None:
+        """Collect and add a menu item through the administrator controls."""
+        sku = self.dialogs.ask_string("Admin Menu", "SKU:")
+        name = self.dialogs.ask_string("Admin Menu", "Name:")
+        category = self.dialogs.ask_string("Admin Menu", "Category:")
+        price = self.dialogs.ask_float("Admin Menu", "Price:", minvalue=0)
+        stock = self.dialogs.ask_int("Admin Menu", "Opening stock:", minvalue=0)
+        if sku is None or name is None or category is None or price is None or stock is None:
+            return
+        try:
+            self.admin.create_menu_item(MenuItem(sku, name, category, price, stock))
+            self.refresh_menu_panel()
+            self.status_bar.set_status(f"Added {name} to the menu.")
+        except (PermissionError, ValueError) as exc:
+            self.dialogs.error("Menu Error", str(exc))
+
+    def remove_menu_item(self) -> None:
+        """Remove a menu item by SKU through the administrator controls.
+
+        Deleting a menu item is destructive and cannot be undone from the
+        UI, so it is confirmed before the admin controls are called.
+        """
+        sku = self.dialogs.ask_string("Admin Menu", "SKU to remove:")
+        if not sku:
+            return
+        if not self.dialogs.confirm(
+            "Remove Menu Item",
+            f"Remove '{sku}' from the menu? This cannot be undone.",
+        ):
+            self.status_bar.set_status("Menu item removal cancelled.")
+            return
+        try:
+            self.admin.delete_menu_item(sku)
+            self.refresh_menu_panel()
+            self.status_bar.set_status(f"Removed {sku} from the menu.")
+        except (KeyError, ValueError, PermissionError) as exc:
+            self.dialogs.error("Menu Error", str(exc))
 
 
 def main() -> None:

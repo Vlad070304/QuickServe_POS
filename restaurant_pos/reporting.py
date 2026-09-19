@@ -255,7 +255,7 @@ class SalesReport:
     ) -> dict[str, Decimal]:
         """Allocate each order discount across its item categories."""
         result: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
-        for group in self._group_rows(self._rows(start, end)).items():
+        for _order_number, group in self._group_rows(self._rows(start, end)).items():
             line_values = [Decimal(str(row["unit_price"])) * row["quantity"] for row in group]
             line_total = sum(line_values, Decimal("0"))
             discount = Decimal(str(group[0]["discount"]))

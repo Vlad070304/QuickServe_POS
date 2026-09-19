@@ -261,7 +261,7 @@ class SQLiteStore:
             if cursor.lastrowid is None:
                 raise RuntimeError("SQLite did not return an order ID.")
             self.connection.executemany(
-                "INSERT INTO order_items VALUES (?,?,?,?,?)",
+                "INSERT INTO order_items VALUES (?,?,?,?,?,?)",
                 [(cursor.lastrowid, item.sku, item.name, item.quantity, str(item.unit_price),
                   getattr(item, "category", "Uncategorized"))
                  for item in order.items],
@@ -593,8 +593,9 @@ class SQLiteStore:
             for order_number, order_rows in grouped.items():
                 first = order_rows[0]
                 cursor = self.connection.execute(
-                    """INSERT INTO orders(order_number,customer,employee,subtotal,tax,discount,total,
-                       payment_json,receipt,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    """INSERT INTO orders(order_number,customer,employee,subtotal,tax,
+                       discount,total,payment_json,receipt,created_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?)""",
                     (order_number, first["customer"], first.get("employee", ""),
                      first["subtotal"], first["tax"],
                      first["discount"], first["total"], "[]", "Imported sale",
