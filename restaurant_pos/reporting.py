@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import csv
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from io import StringIO
 from pathlib import Path
-from typing import List
+from typing import Iterable, List
 
 from .payments import Order
 from .storage import SQLiteStore
@@ -164,3 +164,224 @@ class SalesReport:
         for name, qty in sorted(item_counts.items()):
             lines.append(f"{name}: {qty} sold")
         return "\n".join(lines)
+
+    @staticmethod
+    def _period(
+        start: date | datetime | None, end: date | datetime | None
+    ) -> tuple[datetime | None, datetime | None]:
+        """Normalize report dates to a half-open datetime interval."""
+        start_value = (
+            datetime.combine(start, time.min) if isinstance(start, date) and
+            not isinstance(start, datetime) else start
+        )
+        end_value = (
+            datetime.combine(end + timedelta(days=1), time.min)
+            if isinstance(end, date) and not isinstance(end, datetime) else end
+        )
+        if start_value and end_value and start_value >= end_value:
+            raise ValueError("Report start must be before report end.")
+        return start_value, end_value
+
+    def _rows(
+        self, start: date | datetime | None = None,
+        end: date | datetime | None = None,
+    ) -> list:
+        """Return persisted reporting rows, or synthesized in-memory rows."""
+        start_value, end_value = self._period(start, end)
+        if self.store:
+            def to_text(value: datetime | None) -> str | None:
+                return value.isoformat() if value else None
+
+            return self.store.reporting_orders(to_text(start_value), to_text(end_value))
+        rows = []
+        for order in self.orders:
+            if start_value and order.created_at < start_value:
+                continue
+            if end_value and order.created_at >= end_value:
+                continue
+            totals = order.calculate_totals()
+            for item in order.items:
+                rows.append({
+                    "order_number": order.order_number, "created_at": order.created_at.isoformat(),
+                    "customer": order.customer, "employee": getattr(order, "employee", ""),
+                    "subtotal": totals["subtotal"], "tax": totals["tax"],
+                    "discount": totals["discount_amount"], "total": totals["total"],
+                    "payment_status": "paid", "sku": item.sku, "name": item.name,
+                    "category": getattr(item, "category", "Uncategorized"),
+                    "quantity": item.quantity, "unit_price": item.unit_price,
+                })
+        return rows
+
+    @staticmethod
+    def _sum(values: Iterable[Decimal]) -> Decimal:
+        """Sum currency values and normalize them to cents."""
+        return sum(values, Decimal("0")).quantize(Decimal("0.01"))
+
+    def period_totals(
+        self, start: date | datetime | None = None,
+        end: date | datetime | None = None,
+    ) -> dict[str, Decimal]:
+        """Return persisted or in-memory totals for a half-open date range."""
+        rows = self._rows(start, end)
+        orders = {row["order_number"]: row for row in rows}
+        gross = self._sum(Decimal(str(row["total"])) for row in orders.values())
+        subtotal = self._sum(Decimal(str(row["subtotal"])) for row in orders.values())
+        tax = self._sum(Decimal(str(row["tax"])) for row in orders.values())
+        discount = self._sum(Decimal(str(row["discount"])) for row in orders.values())
+        refunds = self._adjustment_totals(start, end)["refunds"]
+        return {
+            "orders": Decimal(len(orders)), "subtotal": subtotal, "discount": discount,
+            "tax": tax, "gross_sales": gross, "refunds": refunds,
+            "net_sales": (gross - refunds).quantize(Decimal("0.01")),
+        }
+
+    def tax_totals(
+        self, start: date | datetime | None = None,
+        end: date | datetime | None = None,
+    ) -> Decimal:
+        """Return tax collected for the selected date range."""
+        return self.period_totals(start, end)["tax"]
+
+    def net_sales(
+        self, start: date | datetime | None = None,
+        end: date | datetime | None = None,
+    ) -> Decimal:
+        """Return gross sales less refunds (voids are tracked separately)."""
+        return self.period_totals(start, end)["net_sales"]
+
+    def discounts_by_category(
+        self, start: date | datetime | None = None,
+        end: date | datetime | None = None,
+    ) -> dict[str, Decimal]:
+        """Allocate each order discount across its item categories."""
+        result: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+        for group in self._group_rows(self._rows(start, end)).items():
+            line_values = [Decimal(str(row["unit_price"])) * row["quantity"] for row in group]
+            line_total = sum(line_values, Decimal("0"))
+            discount = Decimal(str(group[0]["discount"]))
+            for row, value in zip(group, line_values):
+                if line_total:
+                    result[row["category"]] += discount * value / line_total
+        return {key: value.quantize(Decimal("0.01")) for key, value in result.items()}
+
+    def discounts_by_employee(
+        self, start: date | datetime | None = None,
+        end: date | datetime | None = None,
+    ) -> dict[str, Decimal]:
+        """Return discounts grouped by the employee recorded on each order."""
+        result: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+        for row in self._unique_orders(self._rows(start, end)):
+            result[row["employee"] or "Unassigned"] += Decimal(str(row["discount"]))
+        return {key: value.quantize(Decimal("0.01")) for key, value in result.items()}
+
+    def discounts_by_period(
+        self, start: date | datetime | None = None,
+        end: date | datetime | None = None,
+    ) -> dict[str, Decimal]:
+        """Return discounts grouped by calendar day in the selected range."""
+        result: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+        for row in self._unique_orders(self._rows(start, end)):
+            day = str(row["created_at"])[:10]
+            result[day] += Decimal(str(row["discount"]))
+        return {key: value.quantize(Decimal("0.01")) for key, value in sorted(result.items())}
+
+    def payment_totals(
+        self, start: date | datetime | None = None,
+        end: date | datetime | None = None,
+    ) -> dict[str, Decimal]:
+        """Return settled payment totals by tender method."""
+        if self.store:
+            start_value, end_value = self._period(start, end)
+            payments = self.store.reporting_payments(
+                start_value.isoformat() if start_value else None,
+                end_value.isoformat() if end_value else None,
+            )
+            return {method: self._sum(
+                Decimal(str(row["amount"])) for row in payments
+                if row["method"] == method and row["status"] == "paid"
+            ) for method in sorted({row["method"] for row in payments})}
+        return self._payment_totals_in_memory(start, end)
+
+    def drawer_reconciliation(
+        self, counted_cash: float | Decimal, *,
+        opening_cash: float | Decimal = Decimal("0"),
+        start: date | datetime | None = None,
+        end: date | datetime | None = None,
+    ) -> dict[str, Decimal]:
+        """Compare expected cash in the drawer with a counted closing balance."""
+        cash_sales = self.payment_totals(start, end).get("cash", Decimal("0"))
+        adjustments = self._adjustment_totals(start, end)
+        opening = Decimal(str(opening_cash)).quantize(Decimal("0.01"))
+        counted = Decimal(str(counted_cash)).quantize(Decimal("0.01"))
+        expected = opening + cash_sales - adjustments["cash_adjustments"]
+        return {"opening_cash": opening, "cash_sales": cash_sales,
+                "cash_adjustments": adjustments["cash_adjustments"],
+                "expected_cash": expected, "counted_cash": counted,
+                "variance": (counted - expected).quantize(Decimal("0.01"))}
+
+    def voids_vs_refunds(
+        self, start: date | datetime | None = None,
+        end: date | datetime | None = None,
+    ) -> dict[str, Decimal]:
+        """Return separate totals for voided payments and customer refunds."""
+        return self._adjustment_totals(start, end)
+
+    def export_accounting_csv(
+        self, path: str | Path | None = None,
+        start: date | datetime | None = None,
+        end: date | datetime | None = None,
+    ) -> str:
+        """Export accounting-friendly journal rows for sales and adjustments."""
+        output = StringIO()
+        writer = csv.writer(output)
+        writer.writerow(["date", "order", "entry_type", "account", "method", "amount"])
+        for row in self._unique_orders(self._rows(start, end)):
+            writer.writerow([row["created_at"], row["order_number"], "sale",
+                             "sales", "", row["total"]])
+            writer.writerow([row["created_at"], row["order_number"], "tax",
+                             "tax_payable", "", row["tax"]])
+        for row in self._adjustment_rows(start, end):
+            writer.writerow([row["created_at"], row["order_number"], row["kind"],
+                             "sales_returns", "", row["amount"]])
+        value = output.getvalue()
+        if path:
+            Path(path).write_text(value, encoding="utf-8", newline="")
+        return value
+
+    @staticmethod
+    def _group_rows(rows: list) -> dict[str, list]:
+        grouped: dict[str, list] = defaultdict(list)
+        for row in rows:
+            grouped[row["order_number"]].append(row)
+        return grouped
+
+    @staticmethod
+    def _unique_orders(rows: list) -> list:
+        """Keep one row per order while preserving chronological order."""
+        return list({row["order_number"]: row for row in rows}.values())
+
+    def _adjustment_rows(self, start, end) -> list:
+        if self.store:
+            start_value, end_value = self._period(start, end)
+            return self.store.reporting_adjustments(
+                start_value.isoformat() if start_value else None,
+                end_value.isoformat() if end_value else None,
+            )
+        return []
+
+    def _adjustment_totals(self, start, end) -> dict[str, Decimal]:
+        rows = self._adjustment_rows(start, end)
+        refunds = self._sum(Decimal(str(row["amount"])) for row in rows if row["kind"] == "refund")
+        voids = self._sum(Decimal(str(row["amount"])) for row in rows if row["kind"] == "void")
+        return {"refunds": refunds, "voids": voids, "cash_adjustments": refunds + voids}
+
+    def _payment_totals_in_memory(self, start, end) -> dict[str, Decimal]:
+        result: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+        for order in self.orders:
+            start_value, end_value = self._period(start, end)
+            if start_value and order.created_at < start_value:
+                continue
+            if end_value and order.created_at >= end_value:
+                continue
+            result["cash"] += order.calculate_totals()["total"]
+        return {key: value.quantize(Decimal("0.01")) for key, value in result.items()}

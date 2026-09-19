@@ -15,6 +15,9 @@ A desktop point-of-sale application built with Python and Tkinter for fast resta
 - Receipt generation for customer checkout
 - PDF receipts, thermal-printer output, and separate kitchen tickets
 - Sales summary logic for reporting and auditing
+- Date-range reporting from persisted orders, including net sales after refunds,
+  tax totals, category/employee/time-period discounts, payment methods, cash
+  drawer reconciliation, void-vs-refund totals, and accounting CSV journals
 
 ## Project layout
 

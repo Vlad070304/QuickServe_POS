@@ -53,7 +53,8 @@ class Order:
     """Represents the current customer order."""
 
     def __init__(self, tax_rate: float | Decimal = 0.08, *, customer: str = "",
-                 order_number: str | None = None, created_at: datetime | None = None) -> None:
+                 order_number: str | None = None, created_at: datetime | None = None,
+                 employee: str = "") -> None:
         """Create an empty order with the supplied tax rate."""
         self.items: List[OrderItem] = []
         self.discount_percentage = Decimal("0")
@@ -61,6 +62,7 @@ class Order:
         self.paid = False
         self.order_number = order_number or uuid4().hex[:10].upper()
         self.customer = customer
+        self.employee = employee
         self.created_at = created_at or datetime.now(timezone.utc)
 
     def add_item(self, menu_item, quantity: int = 1) -> None:

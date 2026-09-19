@@ -108,7 +108,8 @@ class CheckoutService:
     def _copy_order(order: Order) -> Order:
         """Create an independent sales record before the active order is reset."""
         snapshot = Order(tax_rate=order.tax_rate, customer=order.customer,
-                         order_number=order.order_number, created_at=order.created_at)
+                         order_number=order.order_number, created_at=order.created_at,
+                         employee=order.employee)
         snapshot.items = [
             OrderItem(
                 sku=item.sku,

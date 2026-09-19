@@ -33,20 +33,21 @@ class SQLiteStore:
             );
             CREATE TABLE IF NOT EXISTS orders (
               id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-              order_number TEXT UNIQUE, customer TEXT,
+              order_number TEXT UNIQUE, customer TEXT, employee TEXT NOT NULL DEFAULT '',
               subtotal TEXT NOT NULL, tax TEXT NOT NULL, discount TEXT NOT NULL,
               total TEXT NOT NULL, payment_json TEXT NOT NULL, receipt TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS order_items (
               order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
               sku TEXT NOT NULL, name TEXT NOT NULL, quantity INTEGER NOT NULL,
-              unit_price TEXT NOT NULL
+              unit_price TEXT NOT NULL, category TEXT NOT NULL DEFAULT 'Uncategorized'
             );
             CREATE TABLE IF NOT EXISTS refunds (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               order_number TEXT NOT NULL REFERENCES orders(order_number),
               amount TEXT NOT NULL,
               payment_id INTEGER,
+              kind TEXT NOT NULL DEFAULT 'refund',
               created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             CREATE TABLE IF NOT EXISTS payments (
@@ -80,6 +81,7 @@ class SQLiteStore:
         self._run_migrations()
         self._ensure_order_lifecycle_columns()
         self._ensure_refund_columns()
+        self._ensure_reporting_columns()
         self.connection.commit()
 
     def _ensure_order_lifecycle_columns(self) -> None:
@@ -105,6 +107,30 @@ class SQLiteStore:
         }
         if "payment_id" not in columns:
             self.connection.execute("ALTER TABLE refunds ADD COLUMN payment_id INTEGER")
+
+    def _ensure_reporting_columns(self) -> None:
+        """Add reporting dimensions to databases created by older versions."""
+        order_columns = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(orders)")
+        }
+        if "employee" not in order_columns:
+            self.connection.execute(
+                "ALTER TABLE orders ADD COLUMN employee TEXT NOT NULL DEFAULT ''"
+            )
+        item_columns = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(order_items)")
+        }
+        if "category" not in item_columns:
+            self.connection.execute(
+                "ALTER TABLE order_items ADD COLUMN category TEXT NOT NULL DEFAULT 'Uncategorized'"
+            )
+        refund_columns = {
+            row["name"] for row in self.connection.execute("PRAGMA table_info(refunds)")
+        }
+        if "kind" not in refund_columns:
+            self.connection.execute(
+                "ALTER TABLE refunds ADD COLUMN kind TEXT NOT NULL DEFAULT 'refund'"
+            )
 
     def _run_migrations(self) -> None:
         """Apply schema changes in order so upgrades are explicit and repeatable."""
@@ -185,19 +211,21 @@ class SQLiteStore:
             cursor = self.connection.execute(
                 "INSERT INTO orders("
                 "subtotal,tax,discount,total,payment_json,receipt,"
-                "order_number,customer,created_at,payment_status,idempotency_key) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "order_number,customer,employee,created_at,payment_status,idempotency_key) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (str(totals["subtotal"]), str(totals["tax"]), str(totals["discount_amount"]),
                  str(totals["total"]), json.dumps(payment_records, default=str), order.receipt(),
-                 order.order_number, order.customer, order.created_at.isoformat(),
+                 order.order_number, order.customer, getattr(order, "employee", ""),
+                 order.created_at.isoformat(),
                  status, idempotency_key),
             )
             if cursor.lastrowid is None:
                 raise RuntimeError("SQLite did not return an order ID.")
             order_id = cursor.lastrowid
             self.connection.executemany(
-                "INSERT INTO order_items VALUES (?,?,?,?,?)",
-                [(order_id, item.sku, item.name, item.quantity, str(item.unit_price))
+                "INSERT INTO order_items VALUES (?,?,?,?,?,?)",
+                [(order_id, item.sku, item.name, item.quantity, str(item.unit_price),
+                  getattr(item, "category", "Uncategorized"))
                  for item in order.items],
             )
             self._save_payments(order.order_number, payment_records, status, idempotency_key)
@@ -222,18 +250,20 @@ class SQLiteStore:
             cursor = self.connection.execute(
                 "INSERT INTO orders("
                 "subtotal,tax,discount,total,payment_json,receipt,"
-                "order_number,customer,created_at,payment_status,idempotency_key) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "order_number,customer,employee,created_at,payment_status,idempotency_key) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (str(totals["subtotal"]), str(totals["tax"]), str(totals["discount_amount"]),
                  str(totals["total"]), json.dumps(payment_records, default=str), order.receipt(),
-                 order.order_number, order.customer, order.created_at.isoformat(),
+                 order.order_number, order.customer, getattr(order, "employee", ""),
+                 order.created_at.isoformat(),
                  status, idempotency_key),
             )
             if cursor.lastrowid is None:
                 raise RuntimeError("SQLite did not return an order ID.")
             self.connection.executemany(
                 "INSERT INTO order_items VALUES (?,?,?,?,?)",
-                [(cursor.lastrowid, item.sku, item.name, item.quantity, str(item.unit_price))
+                [(cursor.lastrowid, item.sku, item.name, item.quantity, str(item.unit_price),
+                  getattr(item, "category", "Uncategorized"))
                  for item in order.items],
             )
             self._save_payments(order.order_number, payment_records, status, idempotency_key)
@@ -318,12 +348,32 @@ class SQLiteStore:
         ).fetchone()
         return row["value"] if row else default
 
-    def save_refund(self, order_number: str, amount) -> None:
-        """Persist a refund against an existing order."""
+    def save_refund(self, order_number: str, amount, *, kind: str = "refund") -> None:
+        """Persist a refund or void against an existing order."""
+        if kind not in {"refund", "void"}:
+            raise ValueError("Refund kind must be 'refund' or 'void'.")
         with self.connection:
             self.connection.execute(
-                "INSERT INTO refunds(order_number, amount) VALUES (?, ?)",
-                (order_number, str(amount)),
+                "INSERT INTO refunds(order_number, amount, kind) VALUES (?, ?, ?)",
+                (order_number, str(amount), kind),
+            )
+
+    def void_payment(self, payment_id: int) -> None:
+        """Void an unsettled payment and record it separately from a refund."""
+        with self.connection:
+            payment = self.connection.execute(
+                "SELECT order_number, amount, status FROM payments WHERE id = ?", (payment_id,)
+            ).fetchone()
+            if payment is None:
+                raise KeyError(payment_id)
+            if payment["status"] != "paid":
+                raise ValueError("Only paid payments can be voided.")
+            self.connection.execute(
+                "UPDATE payments SET status = 'voided' WHERE id = ?", (payment_id,)
+            )
+            self.connection.execute(
+                "INSERT INTO refunds(order_number, amount, payment_id, kind) VALUES (?, ?, ?, ?)",
+                (payment["order_number"], payment["amount"], payment_id, "void"),
             )
 
     def create_staff_account(
@@ -424,6 +474,47 @@ class SQLiteStore:
             (query, pattern, pattern, pattern, pattern, on_date, on_date),
         ))
 
+    def reporting_orders(
+        self, start: str | None = None, end: str | None = None
+    ) -> list[sqlite3.Row]:
+        """Return persisted orders and dimensions within a half-open date range."""
+        return list(self.connection.execute(
+            """SELECT o.id, o.order_number, o.created_at, o.customer, o.employee,
+                      o.subtotal, o.tax, o.discount, o.total, o.payment_status,
+                      i.sku, i.name, i.category, i.quantity, i.unit_price
+               FROM orders o JOIN order_items i ON i.order_id = o.id
+               WHERE (? IS NULL OR o.created_at >= ?)
+                 AND (? IS NULL OR o.created_at < ?)
+               ORDER BY o.created_at, o.id, i.rowid""",
+            (start, start, end, end),
+        ))
+
+    def reporting_payments(
+        self, start: str | None = None, end: str | None = None
+    ) -> list[sqlite3.Row]:
+        """Return persisted payment tenders within a half-open date range."""
+        return list(self.connection.execute(
+            """SELECT p.order_number, p.method, p.amount, p.status, p.created_at
+               FROM payments p
+               WHERE (? IS NULL OR p.created_at >= ?)
+                 AND (? IS NULL OR p.created_at < ?)
+               ORDER BY p.created_at, p.id""",
+            (start, start, end, end),
+        ))
+
+    def reporting_adjustments(
+        self, start: str | None = None, end: str | None = None
+    ) -> list[sqlite3.Row]:
+        """Return persisted refunds and voids within a half-open date range."""
+        return list(self.connection.execute(
+            """SELECT r.order_number, r.amount, r.kind, r.created_at
+               FROM refunds r
+               WHERE (? IS NULL OR r.created_at >= ?)
+                 AND (? IS NULL OR r.created_at < ?)
+               ORDER BY r.created_at, r.id""",
+            (start, start, end, end),
+        ))
+
     def export_menu_csv(self, path: str | Path) -> None:
         """Write the current menu to a portable CSV file."""
         rows = self.load_menu_items()
@@ -467,14 +558,15 @@ class SQLiteStore:
     def export_sales_csv(self, path: str | Path) -> None:
         """Export completed sales and their line items as a portable CSV file."""
         rows = self.connection.execute(
-            """SELECT o.order_number, o.created_at, o.customer, i.sku, i.name,
-                      i.quantity, i.unit_price, o.subtotal, o.tax, o.discount, o.total
+            """SELECT o.order_number, o.created_at, o.customer, o.employee, i.sku, i.name,
+                      i.category, i.quantity, i.unit_price, o.subtotal, o.tax, o.discount, o.total
                FROM orders o JOIN order_items i ON i.order_id=o.id ORDER BY o.id, i.rowid"""
         )
         with Path(path).open("w", encoding="utf-8", newline="") as handle:
             writer = csv.writer(handle)
-            writer.writerow(["order_number", "created_at", "customer", "sku", "name",
-                             "quantity", "unit_price", "subtotal", "tax", "discount", "total"])
+            writer.writerow(["order_number", "created_at", "customer", "employee", "sku",
+                             "name", "category", "quantity", "unit_price", "subtotal",
+                             "tax", "discount", "total"])
             writer.writerows(tuple(row) for row in rows)
 
     def import_sales_csv(self, path: str | Path) -> int:
@@ -501,9 +593,10 @@ class SQLiteStore:
             for order_number, order_rows in grouped.items():
                 first = order_rows[0]
                 cursor = self.connection.execute(
-                    """INSERT INTO orders(order_number,customer,subtotal,tax,discount,total,
-                       payment_json,receipt,created_at) VALUES (?,?,?,?,?,?,?,?,?)""",
-                    (order_number, first["customer"], first["subtotal"], first["tax"],
+                    """INSERT INTO orders(order_number,customer,employee,subtotal,tax,discount,total,
+                       payment_json,receipt,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                    (order_number, first["customer"], first.get("employee", ""),
+                     first["subtotal"], first["tax"],
                      first["discount"], first["total"], "[]", "Imported sale",
                      first["created_at"]),
                 )
@@ -511,8 +604,9 @@ class SQLiteStore:
                 if order_id is None:
                     raise RuntimeError("SQLite did not return an order ID.")
                 self.connection.executemany(
-                    "INSERT INTO order_items VALUES (?,?,?,?,?)",
-                    [(order_id, row["sku"], row["name"], int(row["quantity"]), row["unit_price"])
+                    "INSERT INTO order_items VALUES (?,?,?,?,?,?)",
+                    [(order_id, row["sku"], row["name"], int(row["quantity"]), row["unit_price"],
+                      row.get("category", "Uncategorized"))
                      for row in order_rows],
                 )
         return len(grouped)

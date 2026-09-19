@@ -1,6 +1,6 @@
 """Tests for the QuickServe POS business logic."""
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 import time
 
@@ -524,6 +524,39 @@ def test_payment_methods_idempotency_and_partial_tenders():
     order.add_item(item)
     with pytest.raises(ValueError, match="Insufficient"):
         processor.process_split_payment(order, {"cash": 1})
+
+
+def test_persisted_reporting_covers_ranges_adjustments_and_accounting_export(tmp_path):
+    """Aggregate persisted orders by reporting dimensions and export journal rows."""
+    path = tmp_path / "reporting.db"
+    store = SQLiteStore(path)
+    report = SalesReport(path)
+    order = Order(
+        tax_rate=Decimal("0.10"), customer="Ada", employee="E-1",
+        order_number="ACCOUNT-1", created_at=datetime(2026, 1, 2, 12, tzinfo=timezone.utc),
+    )
+    order.add_item(MenuItem("FOOD", "Food", "Main", 10, stock=1))
+    order.apply_discount(10)
+    store.save_order(
+        order,
+        [{"method": "cash", "amount": Decimal("9.90")}],
+    )
+    store.save_refund("ACCOUNT-1", Decimal("1.00"))
+
+    totals = report.period_totals(date(2026, 1, 1))
+    assert totals["gross_sales"] == Decimal("9.90")
+    assert totals["net_sales"] == Decimal("8.90")
+    assert totals["tax"] == Decimal("0.90")
+    assert report.discounts_by_category()["Main"] == Decimal("1.00")
+    assert report.discounts_by_employee()["E-1"] == Decimal("1.00")
+    assert report.discounts_by_period() == {"2026-01-02": Decimal("1.00")}
+    assert report.payment_totals()["cash"] == Decimal("9.90")
+    assert report.voids_vs_refunds()["refunds"] == Decimal("1.00")
+    assert report.drawer_reconciliation(8.90)["variance"] == Decimal("0.00")
+    exported = report.export_accounting_csv()
+    assert "sales_returns" in exported
+    assert "tax_payable" in exported
+    store.close()
 
 
 def test_backup_scheduler_creates_backup_and_rejects_duplicate_start(tmp_path):
